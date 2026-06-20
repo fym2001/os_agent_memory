@@ -1,0 +1,2 @@
+"""Memories page placeholder."""
+

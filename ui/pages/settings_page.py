@@ -1,0 +1,2 @@
+"""Settings page placeholder."""
+

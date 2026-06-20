@@ -1,0 +1,2 @@
+"""Embedding tests placeholder."""
+

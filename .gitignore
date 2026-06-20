@@ -1,0 +1,10 @@
+.idea/
+__pycache__/
+*.py[cod]
+*.db
+*.faiss
+memory_store/
+data/processed/
+data/raw/*.jsonl
+data/raw/*.db
+*.log

@@ -1,0 +1,2 @@
+"""Initialize SQLite databases placeholder."""
+

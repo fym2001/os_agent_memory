@@ -1,0 +1,2 @@
+"""Vector store tests placeholder."""
+
