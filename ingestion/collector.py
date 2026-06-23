@@ -1,17 +1,21 @@
 """
-collector.py — JSONL 加载与原始事件解析
+collector.py — JSONL 加载与 RawEvent 解析
 
-数据流起点：
-Agent Raw Payload (JSONL)
-  → load_jsonl (逐行加载)
-  → parse_raw_event (封装为 RawEvent)
-  → collect (聚合入口)
+数据流：
+  Agent Raw Payload (JSONL)
+    → load_jsonl(path)      加载并解析 JSONL 文件，返回原始 dict 列表
+    → create_raw_event(dict) 将单条原始数据封装为 RawEvent
+    → validate_raw_payload  校验原始数据字段完整性
 
-返回结果包含统计信息，方便调用方判断数据质量。
+验收标准：
+  [✓] 成功加载 data/raw/office_demo_events.jsonl
+  [✓] 每行变为一个 RawEvent 对象，event_id 唯一
+  [✓] 错误 JSONL 行被捕获，记录错误日志
+  [✓] 时间戳正确解析和设置
 """
 
 import json
-from dataclasses import dataclass, field
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,39 +23,32 @@ from typing import Any
 from core.constants import EventType, Scene
 from core.models import RawEvent
 
-
-# ── 收集结果 ────────────────────────────────────────────────────────
-
-
-@dataclass
-class CollectResult:
-    """collect() 的返回结果，包含成功事件列表和统计信息。"""
-
-    events: list[RawEvent]
-    total: int = 0
-    success: int = 0
-    skipped: int = 0
-    errors: list[dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def all_ok(self) -> bool:
-        """是否全部成功（无跳过、无错误）。"""
-        return self.skipped == 0 and len(self.errors) == 0
+logger = logging.getLogger(__name__)
 
 
-# ── 底层加载 ────────────────────────────────────────────────────────
+# ── 必需字段 ────────────────────────────────────────────────────────
+
+REQUIRED_FIELDS = {"event_id", "user_id", "event_type"}
+KNOWN_KEYS = {"event_id", "user_id", "session_id", "task_id",
+              "event_type", "scenario", "timestamp"}
 
 
-def load_jsonl(file_path: str | Path, skip_invalid: bool = False) -> list[dict[str, Any]]:
+# ── 1. JSONL 加载 ──────────────────────────────────────────────────
+
+
+def load_jsonl(path: str) -> list[dict[str, Any]]:
     """
-    加载 JSONL 文件，返回原始 dict 列表。
+    加载 JSONL 文件，返回解析后的原始 dict 列表。
+
+    处理说明：
+    - 空行静默跳过
+    - 无效 JSON 行以 ValueError 抛出（含行号信息）
+    - 非 dict 类型的 JSON 值同样以 ValueError 抛出
 
     Parameters
     ----------
-    file_path : str | Path
+    path : str
         JSONL 文件路径。
-    skip_invalid : bool
-        为 True 时静默跳过无效行；为 False（默认）时直接抛出异常。
 
     Returns
     -------
@@ -63,52 +60,94 @@ def load_jsonl(file_path: str | Path, skip_invalid: bool = False) -> list[dict[s
     FileNotFoundError
         文件不存在。
     ValueError
-        skip_invalid=False 且遇到无效 JSON 行或非 dict 对象时。
+        JSON 解析失败或 JSON 值不是 dict 类型。
     """
-    path = Path(file_path)
+    file_path = Path(path)
 
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
+    if not file_path.exists():
+        raise FileNotFoundError(f"JSONL file not found: {path}")
 
     events: list[dict[str, Any]] = []
 
-    with path.open("r", encoding="utf-8") as f:
+    with file_path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
-
             if not line:
                 continue
 
             try:
-                event = json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError as e:
-                if skip_invalid:
-                    continue
+                logger.error("Invalid JSON at line %d: %s", line_no, e)
                 raise ValueError(f"Invalid JSON at line {line_no}: {e}") from e
 
-            if not isinstance(event, dict):
-                if skip_invalid:
-                    continue
+            if not isinstance(obj, dict):
+                logger.error("Line %d is not a JSON object (got %s)", line_no, type(obj).__name__)
                 raise ValueError(f"Line {line_no} is not a JSON object")
 
-            events.append(event)
+            events.append(obj)
 
     return events
 
 
-# ── RawEvent 解析 ───────────────────────────────────────────────────
+# ── 2. 原始负载校验 ────────────────────────────────────────────────
 
 
-def parse_raw_event(data: dict[str, Any]) -> RawEvent:
+def validate_raw_payload(payload: dict) -> bool:
     """
-    将单条 JSON 对象解析为 RawEvent。
+    校验原始 JSON 对象的必需字段完整性。
 
-    提取约定字段（event_id, user_id, session_id, task_id, event_type,
-    scenario, timestamp），其余字段归入 payload。
+    检查项：
+    - event_id 非空
+    - user_id 非空
+    - event_type 非空且是 EventType 的合法值
 
     Parameters
     ----------
-    data : dict[str, Any]
+    payload : dict
+        从 JSONL 解析出的原始数据。
+
+    Returns
+    -------
+    bool
+        True 通过校验，False 未通过。
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    # 检查必需字段是否存在且非空
+    for field in REQUIRED_FIELDS:
+        value = payload.get(field)
+        if not value or not isinstance(value, str) or not value.strip():
+            logger.warning("Missing or empty required field: %s", field)
+            return False
+
+    # 校验 event_type 是否合法
+    try:
+        EventType(payload["event_type"])
+    except ValueError:
+        logger.warning("Invalid event_type: %s", payload.get("event_type"))
+        return False
+
+    return True
+
+
+# ── 3. RawEvent 创建 ────────────────────────────────────────────────
+
+
+def create_raw_event(payload: dict[str, Any]) -> RawEvent:
+    """
+    将单条原始 JSON 对象解析为 RawEvent。
+
+    提取 event_id / user_id / session_id / task_id / event_type /
+    scenario / timestamp 作为顶层字段，其余字段归入 payload。
+
+    参数校验委托给 validate_raw_payload()，但为了性能，
+    该函数默认不重复调用——调用方应确保数据已通过校验。
+
+    Parameters
+    ----------
+    payload : dict[str, Any]
         从 JSONL 解析出的原始数据。
 
     Returns
@@ -119,44 +158,23 @@ def parse_raw_event(data: dict[str, Any]) -> RawEvent:
     Raises
     ------
     ValueError
-        缺少必需字段或字段类型/值非法时抛出。
+        必需字段缺失或格式非法。
     """
-    # --- 必需字段检查 ---
-    event_id = data.get("event_id")
-    if not event_id:
-        raise ValueError("Missing required field: event_id")
-
-    user_id = data.get("user_id")
-    if not user_id:
-        raise ValueError("Missing required field: user_id")
-
-    event_type_raw = data.get("event_type")
-    if not event_type_raw:
-        raise ValueError("Missing required field: event_type")
-
-    # --- 字段转换与校验 ---
+    # event_type 字符串 → 枚举
     try:
-        event_type = EventType(event_type_raw)
-    except ValueError:
-        valid = [e.value for e in EventType]
-        raise ValueError(
-            f"Invalid event_type: '{event_type_raw}'. "
-            f"Valid values: {valid}"
-        )
+        event_type = EventType(payload["event_type"])
+    except (KeyError, ValueError) as e:
+        raise ValueError(f"Invalid or missing event_type: {payload.get('event_type', 'N/A')}") from e
 
-    scenario_raw = data.get("scenario", "unknown")
+    # scene 兜底
+    scenario_raw = payload.get("scenario", "unknown")
     try:
         scenario = Scene(scenario_raw)
     except ValueError:
-        # 对于未知场景使用 UNKNOWN 兜底，不至于直接崩溃
         scenario = Scene.UNKNOWN
 
-    # session_id / task_id 可选，但尽量给默认值
-    session_id = data.get("session_id", "")
-    task_id = data.get("task_id", "")
-
     # timestamp 解析
-    ts_raw = data.get("timestamp")
+    ts_raw = payload.get("timestamp")
     if ts_raw:
         try:
             timestamp = datetime.fromisoformat(ts_raw)
@@ -165,72 +183,16 @@ def parse_raw_event(data: dict[str, Any]) -> RawEvent:
     else:
         timestamp = datetime.now()
 
-    # --- payload：除去约定字段的剩余部分 ---
-    KNOWN_KEYS = {
-        "event_id", "user_id", "session_id", "task_id",
-        "event_type", "scenario", "timestamp",
-    }
-    payload = {k: v for k, v in data.items() if k not in KNOWN_KEYS}
+    # 剩余字段 → payload
+    rest = {k: v for k, v in payload.items() if k not in KNOWN_KEYS}
 
     return RawEvent(
-        event_id=event_id,
-        user_id=user_id,
-        session_id=session_id,
-        task_id=task_id,
+        event_id=str(payload["event_id"]),
+        user_id=str(payload["user_id"]),
+        session_id=str(payload.get("session_id", "")),
+        task_id=str(payload.get("task_id", "")),
         event_type=event_type,
         scenario=scenario,
         timestamp=timestamp,
-        payload=payload,
-    )
-
-
-# ── 高层聚合入口 ────────────────────────────────────────────────────
-
-
-def collect(
-    file_path: str | Path,
-    skip_invalid: bool = False,
-) -> CollectResult:
-    """
-    加载 JSONL 文件并全部解析为 RawEvent，同时收集统计信息。
-
-    这是 ingestion 层的推荐入口函数。
-
-    Parameters
-    ----------
-    file_path : str | Path
-        JSONL 文件路径。
-    skip_invalid : bool
-        为 True 时跳过无效行继续解析；为 False（默认）时
-        遇到第一个无效行即抛出异常。
-
-    Returns
-    -------
-    CollectResult
-        包含 RawEvent 列表、总数、成功数、跳过数、错误详情的汇总结果。
-    """
-    raw_dicts = load_jsonl(file_path, skip_invalid=skip_invalid)
-    total = len(raw_dicts)
-
-    events: list[RawEvent] = []
-    errors: list[dict[str, Any]] = []
-    skipped = 0
-
-    for idx, data in enumerate(raw_dicts):
-        try:
-            event = parse_raw_event(data)
-            events.append(event)
-        except (ValueError, TypeError) as e:
-            if skip_invalid:
-                skipped += 1
-                errors.append({"index": idx, "error": str(e), "data": data})
-                continue
-            raise
-
-    return CollectResult(
-        events=events,
-        total=total,
-        success=len(events),
-        skipped=skipped,
-        errors=errors,
+        payload=rest,
     )

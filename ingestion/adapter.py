@@ -36,7 +36,6 @@ user_behavior:
   {"action": "open_file", "file": "report.docx", "app": "wps"}
 """
 
-import uuid
 from typing import Any
 
 from core.constants import EventType
@@ -137,13 +136,30 @@ def _build_metadata(payload: dict[str, Any], exclude_keys: set[str]) -> dict[str
 # ── 单条转换逻辑 ────────────────────────────────────────────────────
 
 
-def adapt_event(raw: RawEvent) -> MemoryEvent:
+def map_source(event_type: EventType) -> str:
+    """
+    根据 EventType 返回对应的 MemoryEvent.source 值。
+
+    Parameters
+    ----------
+    event_type : EventType
+        事件类型。
+
+    Returns
+    -------
+    str
+        转换后的 source 字符串。
+    """
+    return _SOURCE_MAP.get(event_type, event_type.value)
+
+
+def raw_event_to_memory_event(raw_event: RawEvent) -> MemoryEvent:
     """
     将单条 RawEvent 转换为 MemoryEvent。
 
     Parameters
     ----------
-    raw : RawEvent
+    raw_event : RawEvent
         原始事件。
 
     Returns
@@ -151,11 +167,11 @@ def adapt_event(raw: RawEvent) -> MemoryEvent:
     MemoryEvent
         标准化后的事件。
     """
-    source = _SOURCE_MAP.get(raw.event_type, raw.event_type.value)
-    actor = _ACTOR_MAP.get(raw.event_type, None)
+    source = _SOURCE_MAP.get(raw_event.event_type, raw_event.event_type.value)
+    actor = _ACTOR_MAP.get(raw_event.event_type, None)
 
-    payload = raw.payload
-    event_type = raw.event_type
+    payload = raw_event.payload
+    event_type = raw_event.event_type
 
     # ── 各 event_type 的分字段提取 ──
     content: str | None = None
@@ -167,8 +183,7 @@ def adapt_event(raw: RawEvent) -> MemoryEvent:
 
     if event_type == EventType.CONVERSATION:
         content = _extract_content(payload) or ""
-        # conversation 的 actor 优先从 payload 取，允许覆盖默认 user
-        actor = payload.get("actor", payload.get("role", actor))
+        # 排期表规约：CONVERSATION → actor="user"，不覆写
         metadata = _build_metadata(payload, {"content", "text", "message", "actor", "role"})
 
     elif event_type == EventType.TOOL_CALL:
@@ -232,13 +247,13 @@ def adapt_event(raw: RawEvent) -> MemoryEvent:
         metadata = payload
 
     return MemoryEvent(
-        event_id=raw.event_id,
-        raw_event_id=raw.event_id,
-        user_id=raw.user_id,
-        session_id=raw.session_id,
-        task_id=raw.task_id,
-        event_type=raw.event_type,
-        scenario=raw.scenario,
+        event_id=raw_event.event_id,
+        raw_event_id=raw_event.event_id,
+        user_id=raw_event.user_id,
+        session_id=raw_event.session_id,
+        task_id=raw_event.task_id,
+        event_type=raw_event.event_type,
+        scenario=raw_event.scenario,
         source=source,
         actor=actor,
         content=content,
@@ -247,8 +262,8 @@ def adapt_event(raw: RawEvent) -> MemoryEvent:
         output=tool_output,
         success=success,
         metadata=metadata,
-        timestamp=raw.timestamp,
-        raw_event=raw,
+        timestamp=raw_event.timestamp,
+        raw_event=raw_event,
     )
 
 
@@ -269,4 +284,4 @@ def adapt_events(raw_events: list[RawEvent]) -> list[MemoryEvent]:
     list[MemoryEvent]
         标准化事件列表（顺序与输入一致）。
     """
-    return [adapt_event(event) for event in raw_events]
+    return [raw_event_to_memory_event(event) for event in raw_events]
