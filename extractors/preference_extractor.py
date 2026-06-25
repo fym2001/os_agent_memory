@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -171,6 +172,11 @@ def _slugify(value: str) -> str:
     return token or "preference"
 
 
+def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
+    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:32]
+
+
 def _normalize_value(key: str, value: str) -> tuple[str, str]:
     raw_value = value.strip()
     if key == "output_format":
@@ -225,6 +231,7 @@ def _candidate_for(
     metadata: dict[str, Any] | None = None,
 ) -> MemoryCandidate:
     candidate = MemoryCandidate(
+        candidate_id=_stable_candidate_id(user_id, MemoryType.PREFERENCE, f"preference.{key}.{normalized_value}"),
         user_id=user_id,
         memory_type=MemoryType.PREFERENCE,
         key=f"preference.{key}.{normalized_value}",
@@ -262,7 +269,8 @@ def _iter_text_fragments(payload: Any) -> Iterable[str]:
         return fragments
     if isinstance(payload, (list, tuple, set)):
         fragments: list[str] = []
-        for item in payload:
+        items = sorted(payload, key=lambda item: str(item)) if isinstance(payload, set) else payload
+        for item in items:
             fragments.extend(_iter_text_fragments(item))
         return fragments
     return [str(payload)]
@@ -389,6 +397,7 @@ def _rebind_candidates(
         rebound.append(
             replace(
                 candidate,
+                candidate_id=_stable_candidate_id(event.user_id, candidate.memory_type, candidate.key),
                 user_id=event.user_id,
                 scenario=event.scenario,
                 source=source,
@@ -467,7 +476,8 @@ def _collect_scalar_params(payload: Any, prefix: str = "") -> list[tuple[str, st
         if isinstance(raw_value, dict):
             collected.extend(_collect_scalar_params(raw_value, prefix=f"{key}."))
         elif isinstance(raw_value, (list, tuple, set)):
-            joined = ", ".join(_normalize_scalar(item) for item in raw_value if item is not None)
+            values = sorted(raw_value, key=lambda item: str(item)) if isinstance(raw_value, set) else raw_value
+            joined = ", ".join(_normalize_scalar(item) for item in values if item is not None)
             if joined:
                 collected.append((key.lower(), joined))
         elif isinstance(raw_value, (str, int, float, bool)):
@@ -486,7 +496,7 @@ def _action_signature(event: MemoryEvent) -> str:
         for key in ("action", "intent", "behavior", "operation"):
             value = event.metadata.get(key)
             if isinstance(value, str) and value.strip():
-                return f"{key}:{re.sub(r'\\s+', ' ', value.strip().lower())}"
+                return f"{key}:{re.sub(r'\s+', ' ', value.strip().lower())}"
     return f"{event.event_type.value}:{event.source.strip().lower()}"
 
 

@@ -23,6 +23,7 @@ def _event(
     output_payload: dict | None = None,
     metadata: dict | None = None,
     success: bool | None = True,
+    timestamp: datetime | None = None,
 ) -> MemoryEvent:
     return MemoryEvent(
         event_id=event_id,
@@ -39,7 +40,7 @@ def _event(
         output=output_payload or {},
         metadata=metadata or {},
         success=success,
-        timestamp=datetime(2026, 6, 23, tzinfo=timezone.utc),
+        timestamp=timestamp or datetime(2026, 6, 23, tzinfo=timezone.utc),
         raw_event={"event_id": event_id},
     )
 
@@ -303,6 +304,110 @@ def test_extract_tool_sequence_deduplicates_repeated_workflows() -> None:
 
     assert len(candidates) == 1
     assert candidates[0].metadata["workflow_signature"] == "download__transform"
+    assert candidates[0].metadata["occurrence_count"] == 2
+    assert set(candidates[0].source_events) == {event.event_id for event in workflow_one + workflow_two}
+
+
+def test_workflow_extraction_orders_events_and_isolates_concurrent_tasks() -> None:
+    base = datetime(2026, 6, 23, tzinfo=timezone.utc)
+    task_one = [
+        _event(
+            "one-download-call",
+            task_id="task-one",
+            event_type=EventType.TOOL_CALL,
+            source="tool",
+            tool_name="download",
+            output_payload={"file": "one.csv"},
+            timestamp=base.replace(second=1),
+        ),
+        _event(
+            "one-download-result",
+            task_id="task-one",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="download",
+            output_payload={"file": "one.csv"},
+            timestamp=base.replace(second=2),
+        ),
+        _event(
+            "one-export-call",
+            task_id="task-one",
+            event_type=EventType.TOOL_CALL,
+            source="tool",
+            tool_name="export",
+            input_payload={"source": "one.csv"},
+            output_payload={"file": "one.xlsx"},
+            timestamp=base.replace(second=3),
+        ),
+        _event(
+            "one-export-result",
+            task_id="task-one",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="export",
+            output_payload={"file": "one.xlsx"},
+            timestamp=base.replace(second=4),
+        ),
+    ]
+    task_two = [
+        _event(
+            "two-search-call",
+            task_id="task-two",
+            event_type=EventType.TOOL_CALL,
+            source="tool",
+            tool_name="search",
+            output_payload={"file": "two.csv"},
+            timestamp=base.replace(second=1),
+        ),
+        _event(
+            "two-search-result",
+            task_id="task-two",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="search",
+            output_payload={"file": "two.csv"},
+            timestamp=base.replace(second=2),
+        ),
+        _event(
+            "two-analyse-call",
+            task_id="task-two",
+            event_type=EventType.TOOL_CALL,
+            source="tool",
+            tool_name="analyse",
+            input_payload={"source": "two.csv"},
+            output_payload={"file": "two.json"},
+            timestamp=base.replace(second=3),
+        ),
+        _event(
+            "two-analyse-result",
+            task_id="task-two",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="analyse",
+            output_payload={"file": "two.json"},
+            timestamp=base.replace(second=4),
+        ),
+    ]
+
+    candidates = WorkflowExtractor.extract_tool_sequence(list(reversed(task_one + task_two)))
+
+    assert len(candidates) == 2
+    by_steps = {tuple(candidate.metadata["tool_names"]): candidate for candidate in candidates}
+    assert set(by_steps) == {("download", "export"), ("search", "analyse")}
+    assert set(by_steps[("download", "export")].source_events) == {event.event_id for event in task_one}
+    assert set(by_steps[("search", "analyse")].source_events) == {event.event_id for event in task_two}
+    assert all(candidate.metadata["reproduction_rate"] >= 0.8 for candidate in candidates)
+
+
+def test_workflow_requires_real_reconstruction_evidence() -> None:
+    events = [
+        _event("call-1", event_type=EventType.TOOL_CALL, source="tool", tool_name="first"),
+        _event("result-1", event_type=EventType.TOOL_RESULT, source="tool", tool_name="first"),
+        _event("call-2", event_type=EventType.TOOL_CALL, source="tool", tool_name="second"),
+        _event("result-2", event_type=EventType.TOOL_RESULT, source="tool", tool_name="second"),
+    ]
+
+    assert WorkflowExtractor.extract_tool_sequence(events) == []
 
 
 def test_workflow_internal_helper_branches_and_empty_paths() -> None:

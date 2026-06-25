@@ -693,3 +693,57 @@ def test_knowledge_template_variants_and_dedup() -> None:
         ]
     )
     assert len(deduped) == 1
+
+
+def test_knowledge_templates_are_isolated_per_user_and_have_stable_keys() -> None:
+    events = [
+        _event(
+            "alice-1",
+            user_id="alice",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="exporter",
+            content="批量导出订单到 Excel",
+            input_payload={"operation": "batch export", "source": "orders_001.csv"},
+            output_payload={"file": "orders_001.xlsx"},
+        ),
+        _event(
+            "alice-2",
+            user_id="alice",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="exporter",
+            content="批量导出订单到 Excel",
+            input_payload={"operation": "batch export", "source": "orders_002.csv"},
+            output_payload={"file": "orders_002.xlsx"},
+        ),
+        _event(
+            "bob-1",
+            user_id="bob",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="exporter",
+            content="批量导出订单到 Excel",
+            input_payload={"operation": "batch export", "source": "orders_003.csv"},
+            output_payload={"file": "orders_003.xlsx"},
+        ),
+        _event(
+            "bob-2",
+            user_id="bob",
+            event_type=EventType.TOOL_RESULT,
+            source="tool",
+            tool_name="exporter",
+            content="批量导出订单到 Excel",
+            input_payload={"operation": "batch export", "source": "orders_004.csv"},
+            output_payload={"file": "orders_004.xlsx"},
+        ),
+    ]
+
+    candidates = KnowledgeExtractor.extract_templates(list(reversed(events)))
+    assert {candidate.user_id for candidate in candidates} == {"alice", "bob"}
+    assert all(all(event_id.startswith(candidate.user_id) for event_id in candidate.source_events) for candidate in candidates)
+
+    repeated = KnowledgeExtractor.extract_templates(events)
+    assert {(candidate.user_id, candidate.key, candidate.candidate_id) for candidate in candidates} == {
+        (candidate.user_id, candidate.key, candidate.candidate_id) for candidate in repeated
+    }

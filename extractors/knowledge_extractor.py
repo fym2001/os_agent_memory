@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -89,6 +90,12 @@ def _slugify(text: str) -> str:
     return token or "knowledge"
 
 
+def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
+    """Return a deterministic candidate id for idempotent extraction output."""
+    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:32]
+
+
 def _text_fragments(payload: Any) -> list[str]:
     if payload is None:
         return []
@@ -106,7 +113,8 @@ def _text_fragments(payload: Any) -> list[str]:
         return fragments
     if isinstance(payload, (list, tuple, set)):
         fragments: list[str] = []
-        for item in payload:
+        items = sorted(payload, key=lambda item: str(item)) if isinstance(payload, set) else payload
+        for item in items:
             fragments.extend(_text_fragments(item))
         return fragments
     return [str(payload)]
@@ -176,6 +184,7 @@ def _make_candidate(
     metadata: dict[str, Any] | None = None,
 ) -> MemoryCandidate:
     return MemoryCandidate(
+        candidate_id=_stable_candidate_id(user_id, memory_type, key),
         user_id=user_id,
         memory_type=memory_type,
         key=key,
@@ -529,34 +538,40 @@ class KnowledgeExtractor:
 
     @staticmethod
     def extract_templates(events: list[MemoryEvent]) -> list[MemoryCandidate]:
-        groups: dict[tuple[str, str], list[MemoryEvent]] = defaultdict(list)
+        # Templates are personal memories.  Grouping across users would merge
+        # evidence from different tenants and leak a second user's activity.
+        groups: dict[tuple[str, str, str, str], list[MemoryEvent]] = defaultdict(list)
         for event in events:
             domain, structure_key, text_key = _template_signature(event)
-            groups[(domain, structure_key, text_key)].append(event)
+            groups[(event.user_id, domain, structure_key, text_key)].append(event)
 
         candidates: list[MemoryCandidate] = []
-        for (domain, structure_key, text_key), group in groups.items():
+        for (user_id, domain, structure_key, text_key), group in sorted(groups.items()):
             if len(group) < 2:
                 continue
-            representative = group[0]
-            confidence = _template_confidence(group)
-            template_key = f"template.{domain}.{_slugify(structure_key)}"
+            ordered_group = sorted(group, key=lambda event: (event.timestamp, event.event_id))
+            representative = ordered_group[0]
+            confidence = _template_confidence(ordered_group)
+            template_key = (
+                f"template.{domain}.{_slugify(structure_key)}."
+                f"{hashlib.sha256(text_key.encode('utf-8')).hexdigest()[:12]}"
+            )
             candidates.append(
                 _make_candidate(
-                    user_id=representative.user_id,
+                    user_id=user_id,
                     memory_type=MemoryType.TEMPLATE,
                     key=template_key,
-                    content=_template_content(domain, group),
-                    scenario=representative.scenario if all(event.scenario == representative.scenario for event in group) else Scene.GLOBAL,
+                    content=_template_content(domain, ordered_group),
+                    scenario=representative.scenario if all(event.scenario == representative.scenario for event in ordered_group) else Scene.GLOBAL,
                     confidence=confidence,
                     source="knowledge_template",
-                    source_events=[event.event_id for event in group],
-                    source_summaries=[event.content or _flatten_event_text(event)[:160] for event in group if event.content or _flatten_event_text(event)],
+                    source_events=[event.event_id for event in ordered_group],
+                    source_summaries=[event.content or _flatten_event_text(event)[:160] for event in ordered_group if event.content or _flatten_event_text(event)],
                     tags=["template", domain],
                     metadata={
                         "domain": domain,
                         "structure_key": structure_key,
-                        "count": len(group),
+                        "count": len(ordered_group),
                         "kind": "reusable_template",
                         "normalized_text": text_key,
                     },

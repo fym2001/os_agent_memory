@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Any, Iterable
 
 from core.constants import EventType, MemoryType, Scene
@@ -84,6 +84,11 @@ def _slugify(text: str) -> str:
     return token or "workflow"
 
 
+def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
+    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:32]
+
+
 def _normalize_text(value: Any) -> str:
     text = str(value).strip().lower()
     return re.sub(r"\s+", " ", text)
@@ -106,7 +111,8 @@ def _iter_text_fragments(payload: Any) -> list[str]:
         return fragments
     if isinstance(payload, (list, tuple, set)):
         fragments: list[str] = []
-        for item in payload:
+        items = sorted(payload, key=lambda item: str(item)) if isinstance(payload, set) else payload
+        for item in items:
             fragments.extend(_iter_text_fragments(item))
         return fragments
     return [str(payload)]
@@ -167,19 +173,20 @@ def _extract_artifacts(event: MemoryEvent) -> set[str]:
     return artifacts
 
 
-def _group_key(event: MemoryEvent) -> tuple[str, str]:
-    return event.user_id, event.session_id
+def _group_key(event: MemoryEvent) -> tuple[str, str, str]:
+    """Keep simultaneous tasks in one session isolated from each other."""
+    return event.user_id, event.session_id, event.task_id
 
 
-def _group_events(events: list[MemoryEvent]) -> list[tuple[tuple[str, str], list[MemoryEvent]]]:
-    grouped: dict[tuple[str, str], list[MemoryEvent]] = defaultdict(list)
-    order: list[tuple[str, str]] = []
+def _group_events(events: list[MemoryEvent]) -> list[tuple[tuple[str, str, str], list[MemoryEvent]]]:
+    grouped: dict[tuple[str, str, str], list[MemoryEvent]] = defaultdict(list)
     for event in events:
         key = _group_key(event)
-        if key not in grouped:
-            order.append(key)
         grouped[key].append(event)
-    return [(key, grouped[key]) for key in order]
+    return [
+        (key, sorted(group, key=lambda event: (event.timestamp, event.event_id)))
+        for key, group in sorted(grouped.items())
+    ]
 
 
 def _segment_scenario(events: list[MemoryEvent]) -> Scene:
@@ -329,6 +336,32 @@ def _workflow_confidence(group_count: int, dependency_count: int, complex_flow: 
     return min(confidence, 0.95)
 
 
+def _workflow_reproduction_rate(groups: list[list[MemoryEvent]], dependencies: list[dict[str, Any]]) -> tuple[float, dict[str, float]]:
+    """Score whether a workflow contains enough evidence to replay safely.
+
+    A workflow is reproducible only when its ordered tool steps, adjacent data
+    dependencies, and terminal tool results are all present.  This is an
+    evidence score, not a fabricated constant, and is intentionally surfaced
+    to downstream storage and evaluation code.
+    """
+    if not groups:
+        return 0.0, {"step_coverage": 0.0, "dependency_coverage": 0.0, "result_coverage": 0.0}
+
+    step_coverage = sum(bool(_step_label(group)) for group in groups) / len(groups)
+    expected_dependencies = max(0, len(groups) - 1)
+    dependency_coverage = 1.0 if expected_dependencies == 0 else min(1.0, len(dependencies) / expected_dependencies)
+    result_coverage = sum(
+        any(event.event_type is EventType.TOOL_RESULT and event.success is not False for event in group)
+        for group in groups
+    ) / len(groups)
+    rate = 0.35 * step_coverage + 0.45 * dependency_coverage + 0.20 * result_coverage
+    return round(min(rate, 1.0), 4), {
+        "step_coverage": round(step_coverage, 4),
+        "dependency_coverage": round(dependency_coverage, 4),
+        "result_coverage": round(result_coverage, 4),
+    }
+
+
 def _workflow_candidate(
     *,
     pattern: str,
@@ -340,12 +373,13 @@ def _workflow_candidate(
     step_labels = [_step_label(group) for group in groups]
     source_event_ids = [event.event_id for event in events]
     source_summaries = [event.content or event.tool_name or event.event_type.value for event in events]
-    reproduction_rate = 1.0 if groups else 0.0
+    reproduction_rate, reconstruction_evidence = _workflow_reproduction_rate(groups, dependencies)
     confidence = _workflow_confidence(len(groups), len(dependencies), pattern != "tool_sequence")
     signature = "__".join(_slugify(label) for label in step_labels)
     boundary = (0, len(events) - 1) if events else (0, 0)
 
     return MemoryCandidate(
+        candidate_id=_stable_candidate_id(events[0].user_id, MemoryType.WORKFLOW, f"workflow.{pattern}.{signature}"),
         user_id=events[0].user_id,
         memory_type=MemoryType.WORKFLOW,
         key=f"workflow.{pattern}.{signature}",
@@ -362,6 +396,9 @@ def _workflow_candidate(
             "tool_names": step_labels,
             "dependencies": dependencies,
             "reproduction_rate": reproduction_rate,
+            "reconstruction_evidence": reconstruction_evidence,
+            "occurrence_count": 1,
+            "task_ids": [events[0].task_id],
             "boundary": boundary,
             "group_event_counts": [len(group) for group in groups],
             "workflow_signature": signature,
@@ -379,41 +416,68 @@ def _extract_candidates_from_segment(segment: list[MemoryEvent], *, mode: str) -
     distinct_tools = len({label for label in (_step_label(group) for group in groups)})
 
     if mode == "tool_sequence":
-        return [
-            _workflow_candidate(
+        candidate = _workflow_candidate(
                 pattern="tool_sequence",
                 prefix="Tool sequence",
                 events=segment,
                 groups=groups,
                 dependencies=dependencies,
-            )
-        ]
+        )
+        return [candidate] if candidate.metadata["reproduction_rate"] >= 0.8 else []
 
     complex_flow = distinct_tools >= 2 or dependencies or has_conversation_glue or len(groups) >= 3
     if not complex_flow:
         return []
 
-    return [
-        _workflow_candidate(
+    candidate = _workflow_candidate(
             pattern="multi_step",
             prefix="Complex workflow",
             events=segment,
             groups=groups,
             dependencies=dependencies,
-        )
-    ]
+    )
+    return [candidate] if candidate.metadata["reproduction_rate"] >= 0.8 else []
 
 
 def _dedupe_candidates(candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
-    unique: list[MemoryCandidate] = []
-    seen: set[tuple[str, str, str]] = set()
+    unique: dict[tuple[str, str, str], MemoryCandidate] = {}
     for candidate in candidates:
         signature = (candidate.user_id, candidate.memory_type.value, candidate.key)
-        if signature in seen:
+        existing = unique.get(signature)
+        if existing is None:
+            unique[signature] = candidate
             continue
-        seen.add(signature)
-        unique.append(candidate)
-    return unique
+
+        merged_events = sorted(set(existing.source_events) | set(candidate.source_events))
+        merged_summaries = list(dict.fromkeys(existing.source_summaries + candidate.source_summaries))
+        old_count = int(existing.metadata.get("occurrence_count", 1))
+        new_count = int(candidate.metadata.get("occurrence_count", 1))
+        weighted_rate = (
+            float(existing.metadata.get("reproduction_rate", 0.0)) * old_count
+            + float(candidate.metadata.get("reproduction_rate", 0.0)) * new_count
+        ) / (old_count + new_count)
+        metadata = dict(existing.metadata)
+        metadata["occurrence_count"] = old_count + new_count
+        metadata["reproduction_rate"] = round(weighted_rate, 4)
+        metadata["task_ids"] = sorted(
+            set(existing.metadata.get("task_ids", [])) | set(candidate.metadata.get("task_ids", []))
+        )
+        unique[signature] = MemoryCandidate(
+            candidate_id=existing.candidate_id,
+            user_id=existing.user_id,
+            memory_type=existing.memory_type,
+            key=existing.key,
+            content=existing.content,
+            scenario=existing.scenario,
+            confidence=max(existing.confidence, candidate.confidence),
+            source=existing.source,
+            source_events=merged_events,
+            source_summaries=merged_summaries,
+            tags=list(dict.fromkeys(existing.tags + candidate.tags)),
+            metadata=metadata,
+            created_at=existing.created_at,
+        )
+    return list(unique.values())
 
 
 class WorkflowExtractor:
