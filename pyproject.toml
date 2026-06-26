@@ -1,0 +1,18 @@
+[project]
+name = "os-agent-memory"
+version = "0.1.0"
+description = "Memory candidate extractors for OS Agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = ["core", "extractors", "memory"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
