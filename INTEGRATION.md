@@ -6,6 +6,10 @@ The extractors consume `core.models.MemoryEvent` and return
 `core.models.MemoryCandidate`. They do not alter `core/constants.py`,
 `core/models.py`, or the Phase 0 SQLite schema.
 
+The B-side extractors are compatible with A-side events produced by
+`ingestion.collector.create_raw_event()` followed by
+`ingestion.adapter.raw_event_to_memory_event()`.
+
 Callers must provide a non-empty `user_id`, `session_id`, and `task_id` for
 tenant isolation and concurrent task separation. Timestamps must be UTC or
 timezone-aware values accepted by `MemoryEvent`.
