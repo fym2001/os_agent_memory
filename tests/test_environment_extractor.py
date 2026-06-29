@@ -79,3 +79,21 @@ def test_environment_extractor_rejects_non_mapping_output() -> None:
         assert "output must be a dict" in str(exc)
     else:  # pragma: no cover - explicit failure branch
         raise AssertionError("non-mapping output must be rejected")
+
+
+def test_environment_preserves_absolute_docs_path_and_filters_nested_secrets() -> None:
+    output = {
+        "docs": "/root/docs",
+        "nested": {
+            "token": "must-not-leak",
+            "paths": {"download_dir": "/root/downloads"},
+        },
+    }
+
+    candidates = EnvironmentExtractor.extract_from_tool_output(output)
+    by_key = {candidate.key: candidate for candidate in candidates}
+    rendered = str([candidate.to_dict() for candidate in candidates])
+
+    assert by_key["environment.path.documents"].metadata["path"] == r"\root\docs"
+    assert by_key["environment.path.downloads"].metadata["path"] == r"\root\downloads"
+    assert "must-not-leak" not in rendered

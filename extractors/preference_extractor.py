@@ -57,6 +57,22 @@ _TOOL_ALIASES = {
     "ripgrep": "rg",
 }
 
+_MAX_EXPLICIT_TEXT_CHARS = 12000
+_FORMAT_VALUE_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?P<value>Markdown|MD|PDF|Word|DOCX|Excel|XLSX|CSV|JSONL|JSON|PPTX)(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_LANGUAGE_VALUE_RE = re.compile(
+    r"(?P<value>中文|英文|中英双语|English|Chinese)",
+    re.IGNORECASE,
+)
+_STYLE_VALUE_RE = re.compile(r"(?P<value>简洁|详细|正式|口语化|分点|结构化|先结论后分析)")
+_PREFERENCE_CUE_RE = re.compile(
+    r"(以后|今后|下次|之后|默认|每次|始终|统一|偏好|喜欢|更喜欢|习惯|倾向|请|麻烦|希望|导出|保存|生成|输出|回复|回答|格式|用|使用|采用)",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[\n\r。！？；;.!?]+")
+
 _PREFERENCE_PATTERNS: list[dict[str, Any]] = [
     {
         "key": "output_format",
@@ -347,6 +363,8 @@ def _extract_from_text(content: str, *, source: str = "conversation") -> list[Me
     text = content or ""
     if not text.strip():
         return []
+    if len(text) > _MAX_EXPLICIT_TEXT_CHARS:
+        text = text[:_MAX_EXPLICIT_TEXT_CHARS]
 
     results: list[MemoryCandidate] = []
     seen: set[tuple[str, str]] = set()
@@ -383,6 +401,66 @@ def _extract_from_text(content: str, *, source: str = "conversation") -> list[Me
                 )
             )
 
+    for candidate in _extract_flexible_preferences(text, source=source):
+        pair = (candidate.metadata.get("field", ""), candidate.metadata.get("normalized_value", ""))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        results.append(candidate)
+
+    return results
+
+
+def _extract_flexible_preferences(text: str, *, source: str) -> list[MemoryCandidate]:
+    """Extract natural-language preferences when modifiers appear between cues.
+
+    Rule-based patterns above are intentionally precise.  Real user utterances
+    often insert task words between the temporal cue and the value, e.g.
+    "以后导出都用 PDF 格式".  This fallback keeps the extraction deterministic
+    while allowing those modifiers.
+    """
+    results: list[MemoryCandidate] = []
+    seen: set[tuple[str, str]] = set()
+
+    for raw_clause in _CLAUSE_SPLIT_RE.split(text):
+        clause = raw_clause.strip()
+        if not clause or len(clause) > 240:
+            continue
+        if not _PREFERENCE_CUE_RE.search(clause):
+            continue
+
+        for key, value_re, summary in (
+            ("output_format", _FORMAT_VALUE_RE, "偏好输出为 {value}"),
+            ("language", _LANGUAGE_VALUE_RE, "偏好使用 {value}"),
+            ("response_style", _STYLE_VALUE_RE, "偏好回答风格为 {value}"),
+        ):
+            for match in value_re.finditer(clause):
+                raw_value = match.group("value").strip()
+                normalized_value, display_value = _normalize_value(key, raw_value)
+                pair = (key, normalized_value)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                confidence = 0.9 if source == "conversation" else 0.84
+                results.append(
+                    _candidate_for(
+                        user_id="",
+                        scenario=Scene.GLOBAL,
+                        key=key,
+                        normalized_value=normalized_value,
+                        display_value=display_value,
+                        content=summary.format(value=display_value),
+                        source=source,
+                        source_summaries=[clause],
+                        tags=["explicit", key, "flexible"],
+                        confidence=confidence,
+                        metadata={
+                            "match_type": "flexible_clause",
+                            "field": key,
+                            "matched_text": clause,
+                        },
+                    )
+                )
     return results
 
 

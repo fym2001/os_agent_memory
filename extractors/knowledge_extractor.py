@@ -9,6 +9,23 @@ from typing import Any, Iterable
 from core.constants import MemoryType, Scene
 from core.models import MemoryCandidate, MemoryEvent
 
+_SENSITIVE_TOKENS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "access_key",
+    "credential",
+    "authorization",
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|password|passwd|secret|token|access[_-]?key|authorization|credential)\b\s*[:=]\s*['\"]?[^'\"\s,;]+"
+)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_LONG_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{24,}(?![A-Za-z0-9])")
+
 
 _FAQ_PATTERNS = [
     re.compile(
@@ -90,6 +107,17 @@ def _slugify(text: str) -> str:
     return token or "knowledge"
 
 
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return any(token in normalized for token in _SENSITIVE_TOKENS)
+
+
+def _redact_sensitive_text(text: str) -> str:
+    text = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
+    return _LONG_SECRET_RE.sub("<redacted>", text)
+
+
 def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
     """Return a deterministic candidate id for idempotent extraction output."""
     payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
@@ -100,14 +128,14 @@ def _text_fragments(payload: Any) -> list[str]:
     if payload is None:
         return []
     if isinstance(payload, str):
-        text = payload.strip()
+        text = _redact_sensitive_text(payload.strip())
         return [text] if text else []
     if isinstance(payload, (int, float, bool)):
         return [str(payload)]
     if isinstance(payload, dict):
         fragments: list[str] = []
         for key, value in payload.items():
-            if key in {"event_id", "raw_event_id", "timestamp", "created_at", "updated_at"}:
+            if key in {"event_id", "raw_event_id", "timestamp", "created_at", "updated_at"} or _is_sensitive_key(key):
                 continue
             fragments.extend(_text_fragments(value))
         return fragments
@@ -128,7 +156,7 @@ def _flatten_event_text(event: MemoryEvent) -> str:
         *(_text_fragments(event.output)),
         *(_text_fragments(event.metadata)),
     ]
-    return "\n".join(part for part in parts if part and str(part).strip())
+    return _redact_sensitive_text("\n".join(part for part in parts if part and str(part).strip()))
 
 
 def _normalize_for_template(text: str) -> str:
@@ -154,6 +182,8 @@ def _summarize_mapping(payload: dict[str, Any] | None, *, max_items: int = 4) ->
         return ""
     fragments: list[str] = []
     for key, value in payload.items():
+        if _is_sensitive_key(key):
+            continue
         if value is None:
             continue
         if isinstance(value, dict):
@@ -161,7 +191,7 @@ def _summarize_mapping(payload: dict[str, Any] | None, *, max_items: int = 4) ->
         if isinstance(value, (list, tuple, set)):
             normalized = ", ".join(str(item) for item in value if item is not None)
         else:
-            normalized = str(value)
+            normalized = _redact_sensitive_text(str(value))
         if normalized:
             fragments.append(f"{key}={normalized}")
         if len(fragments) >= max_items:
@@ -183,17 +213,19 @@ def _make_candidate(
     tags: list[str],
     metadata: dict[str, Any] | None = None,
 ) -> MemoryCandidate:
+    safe_content = _redact_sensitive_text(content)
+    safe_summaries = [_redact_sensitive_text(summary) for summary in source_summaries]
     return MemoryCandidate(
         candidate_id=_stable_candidate_id(user_id, memory_type, key),
         user_id=user_id,
         memory_type=memory_type,
         key=key,
-        content=content,
+        content=safe_content,
         scenario=scenario,
         confidence=max(0.5, min(confidence, 1.0)),
         source=source,
         source_events=source_events,
-        source_summaries=source_summaries,
+        source_summaries=safe_summaries,
         tags=tags,
         metadata=metadata or {},
     )

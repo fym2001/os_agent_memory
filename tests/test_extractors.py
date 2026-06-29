@@ -741,3 +741,45 @@ def test_knowledge_templates_are_isolated_per_user_and_have_stable_keys() -> Non
     assert {(candidate.user_id, candidate.key, candidate.candidate_id) for candidate in candidates} == {
         (candidate.user_id, candidate.key, candidate.candidate_id) for candidate in repeated
     }
+
+
+def test_preference_explicit_allows_modifiers_between_cue_and_format() -> None:
+    event = _event(
+        "evt-pref-flex-1",
+        content="以后导出都用 PDF 格式；下次生成报告默认保存成 Markdown。",
+    )
+
+    candidates = PreferenceExtractor.extract_from_conversation(event)
+    keys = {candidate.key for candidate in candidates}
+
+    assert "preference.output_format.pdf" in keys
+    assert "preference.output_format.markdown" in keys
+
+
+def test_preference_ignores_empty_and_truncates_extreme_noise() -> None:
+    assert PreferenceExtractor.extract_explicit_preference("") == []
+    noisy = "x" * 15000 + " 以后都用 PDF 输出"
+    assert PreferenceExtractor.extract_explicit_preference(noisy) == []
+
+
+def test_knowledge_tool_result_redacts_sensitive_values() -> None:
+    event = _event(
+        "evt-secret-1",
+        event_type=EventType.TOOL_RESULT,
+        source="tool",
+        tool_name="deploy",
+        output_payload={
+            "status": "success",
+            "api_key": "sk-live-1234567890abcdef",
+            "message": "done with password=super-secret token=abcdef1234567890abcdef123456",
+        },
+        metadata={"authorization": "Bearer abcdef1234567890abcdef123456"},
+    )
+
+    candidates = KnowledgeExtractor.extract_from_tool_result(event)
+    rendered = str([candidate.to_dict() for candidate in candidates])
+
+    assert "sk-live" not in rendered
+    assert "super-secret" not in rendered
+    assert "abcdef1234567890abcdef123456" not in rendered
+    assert "<redacted>" in rendered

@@ -11,7 +11,7 @@ from core.models import MemoryCandidate
 
 _SENSITIVE_TOKENS = ("password", "passwd", "secret", "token", "api_key", "access_key", "credential", "authorization")
 _DOWNLOAD_KEYS = {"downloads", "download", "download_dir", "downloads_dir", "download_path"}
-_DOCUMENT_KEYS = {"documents", "document", "documents_dir", "document_dir", "documents_path"}
+_DOCUMENT_KEYS = {"documents", "document", "docs", "doc", "documents_dir", "document_dir", "docs_dir", "doc_dir", "documents_path", "docs_path"}
 _LANGUAGE_KEYS = {"language", "lang", "system_language", "ui_language", "display_language"}
 _REGION_KEYS = {"region", "country", "locale_region", "system_region"}
 _LOCALE_KEYS = {"locale", "system_locale", "language_locale"}
@@ -62,17 +62,25 @@ def _leaf_key(path: tuple[str, ...]) -> str:
 
 
 def _sanitise_path(value: str, directory: str) -> str:
-    path = value.strip().replace("/", "\\")
+    raw_path = value.strip()
+    path = raw_path.replace("/", "\\")
     windows_home = re.compile(r"^[a-zA-Z]:\\users\\[^\\]+(?P<tail>\\.*)$", re.IGNORECASE)
     unix_home = re.compile(r"^/(?:home|users)/[^/]+(?P<tail>/.*)$", re.IGNORECASE)
     match = windows_home.match(path)
     if match:
         path = "~" + match.group("tail")
     else:
-        unix_match = unix_home.match(value.strip())
+        unix_match = unix_home.match(raw_path)
         if unix_match:
             path = "~" + unix_match.group("tail").replace("/", "\\")
-    if not path.lower().endswith(directory.lower()):
+    path_tail = path.rstrip("\\").rsplit("\\", 1)[-1].lower()
+    expected_tails = {
+        "downloads": {"downloads", "download"},
+        "documents": {"documents", "document", "docs", "doc"},
+    }.get(directory.lower(), {directory.lower()})
+    if path_tail not in expected_tails:
+        if re.match(r"^(?:[A-Za-z]:\\|\\\\|\\|~\\)", path) or raw_path.startswith(("/", "~")):
+            return path
         return directory
     return path
 
@@ -87,7 +95,7 @@ def _path_category(path: tuple[str, ...], value: Any) -> str | None:
         lowered = value.replace("/", "\\").rstrip("\\").lower()
         if lowered.endswith("\\downloads"):
             return "downloads"
-        if lowered.endswith("\\documents"):
+        if lowered.endswith("\\documents") or lowered.endswith("\\docs"):
             return "documents"
     return None
 
