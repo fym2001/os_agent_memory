@@ -36,6 +36,25 @@ timezone-aware values accepted by `MemoryEvent`.
 user/type/key input. The downstream storage owner remains responsible for
 upserting records by the candidate key or another approved identity rule.
 
+## Optional LLM semantic layer
+
+The rule-based B extractors remain the stable Phase 1 baseline.  For the next
+stage, `extractors.llm_memory_extractor` adds an optional LLM-enhanced pipeline
+inspired by LangMem, Mem0, and Graphiti design ideas:
+
+- rule extractors provide deterministic baseline candidates;
+- an injected JSON-capable LLM client can add semantic candidates for complex
+  preference, knowledge, workflow, and session-level memory extraction;
+- `CandidateValidator` filters temporary instructions, rejects credential-like
+  content, redacts common sensitive values, and adjusts confidence;
+- `CandidateMerger` de-duplicates rule/LLM candidates, boosts candidates
+  corroborated by both paths, and annotates possible conflicts.
+
+This layer is additive.  It does not change the original extractor method
+signatures, core data models, constants, or Phase 0 SQLite schema.  It has no
+runtime dependency on a specific LLM SDK; production callers must inject an
+adapter implementing `complete_json(prompt, schema)`.  Tests use a fake client.
+
 ## Verification
 
 Runtime code uses only the standard library. For development tests:
