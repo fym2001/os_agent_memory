@@ -97,3 +97,36 @@ def test_environment_preserves_absolute_docs_path_and_filters_nested_secrets() -
     assert by_key["environment.path.documents"].metadata["path"] == r"\root\docs"
     assert by_key["environment.path.downloads"].metadata["path"] == r"\root\downloads"
     assert "must-not-leak" not in rendered
+
+
+def test_environment_extractor_handles_empty_and_partial_output() -> None:
+    assert EnvironmentExtractor.extract_from_tool_output({}) == []
+
+    partial = EnvironmentExtractor.extract_from_tool_output({"locale": "zh"})
+    by_key = {candidate.key: candidate for candidate in partial}
+
+    assert set(by_key) == {"environment.locale.language"}
+    assert by_key["environment.locale.language"].metadata["language"] == "zh"
+
+
+def test_environment_extractor_handles_deep_nested_values_and_sets() -> None:
+    output = {
+        "user_id": "deep-user",
+        "level1": {
+            "level2": {
+                "docs_path": "/users/alice/docs",
+                "installed_packages": {"Python", "WPS Office"},
+                "private_token": "do-not-store",
+            }
+        },
+    }
+
+    candidates = EnvironmentExtractor.extract_from_tool_output(output)
+    by_key = {candidate.key: candidate for candidate in candidates}
+    rendered = str([candidate.to_dict() for candidate in candidates])
+
+    assert by_key["environment.path.documents"].metadata["path"] == r"~\docs"
+    assert "environment.software.python" in by_key
+    assert "environment.software.wps_office" in by_key
+    assert all(candidate.user_id == "deep-user" for candidate in candidates)
+    assert "do-not-store" not in rendered

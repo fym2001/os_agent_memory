@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import defaultdict
@@ -10,6 +9,16 @@ from typing import Any, Iterable
 from core.constants import EventType, MemoryType, Scene
 from core.models import MemoryCandidate, MemoryEvent
 
+from .common import (
+    MAX_CANDIDATE_CONFIDENCE,
+    MIN_INFERRED_CONFIDENCE,
+    extractor_logger,
+    slugify as _shared_slugify,
+    stable_candidate_id as _shared_stable_candidate_id,
+)
+
+
+logger = extractor_logger(__name__)
 
 _FORMAT_ALIASES = {
     "md": "markdown",
@@ -183,14 +192,11 @@ _PREFERENCE_PATTERNS: list[dict[str, Any]] = [
 
 
 def _slugify(value: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", value.strip().lower())
-    token = token.strip("_")
-    return token or "preference"
+    return _shared_slugify(value, fallback="preference")
 
 
 def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
-    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:32]
+    return _shared_stable_candidate_id(user_id, memory_type, key)
 
 
 def _normalize_value(key: str, value: str) -> tuple[str, str]:
@@ -493,7 +499,9 @@ class PreferenceExtractor:
         text = "\n".join(piece for piece in pieces if piece)
         candidates = _extract_from_text(text, source="conversation")
         candidates.extend(_structured_pref_candidates(event))
-        return _dedupe_candidates(_rebind_candidates(candidates, event=event, source="conversation"))
+        result = _dedupe_candidates(_rebind_candidates(candidates, event=event, source="conversation"))
+        logger.debug("preference.extract_from_conversation event_id=%s candidates=%d", event.event_id, len(result))
+        return result
 
     @staticmethod
     def extract_from_tool_result(event: MemoryEvent) -> list[MemoryCandidate]:
@@ -505,11 +513,15 @@ class PreferenceExtractor:
         text = "\n".join(piece for piece in pieces if piece)
         candidates = _extract_from_text(text, source="tool_result")
         candidates.extend(_structured_pref_candidates(event))
-        return _dedupe_candidates(_rebind_candidates(candidates, event=event, source="tool_result"))
+        result = _dedupe_candidates(_rebind_candidates(candidates, event=event, source="tool_result"))
+        logger.debug("preference.extract_from_tool_result event_id=%s candidates=%d", event.event_id, len(result))
+        return result
 
     @staticmethod
     def extract_explicit_preference(content: str) -> list[MemoryCandidate]:
-        return _extract_from_text(content, source="conversation")
+        result = _extract_from_text(content, source="conversation")
+        logger.debug("preference.extract_explicit_preference content_chars=%d candidates=%d", len(content), len(result))
+        return result
 
     @staticmethod
     def extract_implicit_preference(events: list[MemoryEvent]) -> list[MemoryCandidate]:
@@ -520,7 +532,9 @@ class PreferenceExtractor:
         candidates: list[MemoryCandidate] = []
         for user_id, user_events in by_user.items():
             candidates.extend(_extract_implicit_for_user(user_id, user_events))
-        return _dedupe_candidates(candidates)
+        result = _dedupe_candidates(candidates)
+        logger.debug("preference.extract_implicit_preference users=%d events=%d candidates=%d", len(by_user), len(events), len(result))
+        return result
 
 
 def _dedupe_candidates(candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
@@ -612,7 +626,7 @@ def _extract_implicit_for_user(user_id: str, events: list[MemoryEvent]) -> list[
                 source_events=[event.event_id for event in group],
                 source_summaries=[event.content or event.source for event in group],
                 tags=["implicit", "workflow"],
-                confidence=min(0.55 + 0.1 * (len(group) - 3), 0.95),
+                confidence=min(MIN_INFERRED_CONFIDENCE + 0.1 * (len(group) - 3), MAX_CANDIDATE_CONFIDENCE),
                 metadata={
                     "heuristic": "repeated_action",
                     "count": len(group),
@@ -637,7 +651,7 @@ def _extract_implicit_for_user(user_id: str, events: list[MemoryEvent]) -> list[
                 source_events=[event.event_id for event in group],
                 source_summaries=[event.content or event.tool_name or event.source for event in group],
                 tags=["implicit", "tool"],
-                confidence=min(0.55 + 0.1 * (len(group) - 3), 0.95),
+                confidence=min(MIN_INFERRED_CONFIDENCE + 0.1 * (len(group) - 3), MAX_CANDIDATE_CONFIDENCE),
                 metadata={
                     "heuristic": "repeated_tool",
                     "count": len(group),
@@ -661,7 +675,7 @@ def _extract_implicit_for_user(user_id: str, events: list[MemoryEvent]) -> list[
                 source_events=[event.event_id for event in group],
                 source_summaries=[event.content or event.source for event in group],
                 tags=["implicit", "parameter"],
-                confidence=min(0.55 + 0.1 * (len(group) - 3), 0.95),
+                confidence=min(MIN_INFERRED_CONFIDENCE + 0.1 * (len(group) - 3), MAX_CANDIDATE_CONFIDENCE),
                 metadata={
                     "heuristic": "repeated_parameter",
                     "count": len(group),

@@ -13,7 +13,6 @@ Design references:
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import re
 from dataclasses import replace
@@ -26,6 +25,25 @@ from .knowledge_extractor import KnowledgeExtractor
 from .preference_extractor import PreferenceExtractor
 from .tool_extractor import ToolExtractor
 from .workflow_extractor import WorkflowExtractor
+from .common import (
+    CORROBORATION_CONFIDENCE_BONUS,
+    HIGH_CONFIDENCE_THRESHOLD,
+    LLM_DEFAULT_CONFIDENCE,
+    LLM_MISSING_EVIDENCE_PENALTY,
+    LLM_NO_EVIDENCE_MAX_CONFIDENCE,
+    LLM_REASON_BONUS,
+    LLM_SCOPE_BONUS,
+    LLM_SHORT_TERM_PENALTY,
+    MIN_INFERRED_CONFIDENCE,
+    SENSITIVE_REDACTED_MAX_CONFIDENCE,
+    SHORT_ID_LENGTH,
+    extractor_logger,
+    slugify as _shared_slugify,
+    stable_candidate_id as _shared_stable_candidate_id,
+)
+
+
+logger = extractor_logger(__name__)
 
 
 class LLMJsonClient(Protocol):
@@ -96,17 +114,14 @@ _PHONE_RE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
 
 
 def _stable_id(user_id: str, memory_type: MemoryType, key: str) -> str:
-    raw = f"{user_id}|{memory_type.value}|{key}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
+    return _shared_stable_candidate_id(user_id, memory_type, key, length=SHORT_ID_LENGTH)
 
 
 def _slugify(value: Any, *, fallback: str = "memory") -> str:
-    text = str(value or "").strip().lower()
-    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", text).strip("_")
-    return text or fallback
+    return _shared_slugify(value, fallback=fallback)
 
 
-def _clamp_confidence(value: Any, *, default: float = 0.65) -> float:
+def _clamp_confidence(value: Any, *, default: float = LLM_DEFAULT_CONFIDENCE) -> float:
     try:
         score = float(value)
     except (TypeError, ValueError):
@@ -241,7 +256,7 @@ def should_call_llm(event: MemoryEvent, rule_candidates: list[MemoryCandidate] |
     if not rules:
         return has_signal or len(text) > 240
 
-    high_confidence_rules = [candidate for candidate in rules if candidate.confidence >= 0.9]
+    high_confidence_rules = [candidate for candidate in rules if candidate.confidence >= HIGH_CONFIDENCE_THRESHOLD]
     if high_confidence_rules and not _TRANSIENT_RE.search(text):
         return False
     return has_signal
@@ -250,7 +265,7 @@ def should_call_llm(event: MemoryEvent, rule_candidates: list[MemoryCandidate] |
 class CandidateValidator:
     """Validate and sanitize candidates before downstream storage sees them."""
 
-    def __init__(self, *, min_confidence: float = 0.55) -> None:
+    def __init__(self, *, min_confidence: float = MIN_INFERRED_CONFIDENCE) -> None:
         self.min_confidence = min_confidence
 
     def validate(self, candidate: MemoryCandidate) -> MemoryCandidate | None:
@@ -274,11 +289,11 @@ class CandidateValidator:
         confidence = candidate.confidence
         if redacted:
             metadata["sensitive_redacted"] = True
-            confidence = min(confidence, 0.72)
+            confidence = min(confidence, SENSITIVE_REDACTED_MAX_CONFIDENCE)
 
         evidence = str(metadata.get("evidence") or "")
         if candidate.source.startswith("llm") and not evidence.strip():
-            confidence = min(confidence, 0.68)
+            confidence = min(confidence, LLM_NO_EVIDENCE_MAX_CONFIDENCE)
 
         return replace(
             candidate,
@@ -346,7 +361,7 @@ class CandidateMerger:
 
         confidence = max(left.confidence, right.confidence)
         if corroborated:
-            confidence = min(1.0, confidence + 0.05)
+            confidence = min(1.0, confidence + CORROBORATION_CONFIDENCE_BONUS)
 
         content = left.content if left.confidence >= right.confidence else right.content
         return replace(
@@ -423,7 +438,16 @@ class LLMMemoryExtractor:
             candidate = LLMMemoryExtractor._candidate_from_payload(payload, events)
             if candidate is not None:
                 candidates.append(candidate)
-        return CandidateValidator().validate_many(candidates)
+        validated = CandidateValidator().validate_many(candidates)
+        logger.debug(
+            "LLMMemoryExtractor.extract_events mode=%s events=%d payloads=%d candidates=%d validated=%d",
+            mode,
+            len(events),
+            len(payloads),
+            len(candidates),
+            len(validated),
+        )
+        return validated
 
     @staticmethod
     def _candidate_payloads(raw: Any) -> list[dict[str, Any]]:
@@ -493,19 +517,19 @@ class LLMMemoryExtractor:
 
     @staticmethod
     def _adjust_confidence(payload: dict[str, Any]) -> float:
-        confidence = _clamp_confidence(payload.get("confidence"), default=0.65)
+        confidence = _clamp_confidence(payload.get("confidence"), default=LLM_DEFAULT_CONFIDENCE)
         evidence = str(payload.get("evidence") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         scope = str(payload.get("scope") or "").strip()
         if not evidence:
-            confidence -= 0.08
+            confidence -= LLM_MISSING_EVIDENCE_PENALTY
         if reason:
-            confidence += 0.02
+            confidence += LLM_REASON_BONUS
         if scope:
-            confidence += 0.02
+            confidence += LLM_SCOPE_BONUS
         if payload.get("is_long_term") is False:
-            confidence -= 0.2
-        return max(0.0, min(confidence, 1.0))
+            confidence -= LLM_SHORT_TERM_PENALTY
+        return round(max(0.0, min(confidence, 1.0)), 4)
 
 
 class HybridMemoryExtractor:
@@ -528,7 +552,15 @@ class HybridMemoryExtractor:
                 rule_candidates=rule_candidates,
                 mode="conversation",
             )
-        return CandidateMerger.merge(rule_candidates, llm_candidates)
+        merged = CandidateMerger.merge(rule_candidates, llm_candidates)
+        logger.debug(
+            "HybridMemoryExtractor.extract_from_conversation event_id=%s rules=%d llm=%d merged=%d",
+            event.event_id,
+            len(rule_candidates),
+            len(llm_candidates),
+            len(merged),
+        )
+        return merged
 
     @staticmethod
     def extract_from_tool_result(
@@ -544,7 +576,15 @@ class HybridMemoryExtractor:
                 rule_candidates=rule_candidates,
                 mode="tool_result",
             )
-        return CandidateMerger.merge(rule_candidates, llm_candidates)
+        merged = CandidateMerger.merge(rule_candidates, llm_candidates)
+        logger.debug(
+            "HybridMemoryExtractor.extract_from_tool_result event_id=%s rules=%d llm=%d merged=%d",
+            event.event_id,
+            len(rule_candidates),
+            len(llm_candidates),
+            len(merged),
+        )
+        return merged
 
     @staticmethod
     def extract_from_session(
@@ -566,4 +606,12 @@ class HybridMemoryExtractor:
                 rule_candidates=rule_candidates,
                 mode="session",
             )
-        return CandidateMerger.merge(rule_candidates, llm_candidates)
+        merged = CandidateMerger.merge(rule_candidates, llm_candidates)
+        logger.debug(
+            "HybridMemoryExtractor.extract_from_session events=%d rules=%d llm=%d merged=%d",
+            len(events),
+            len(rule_candidates),
+            len(llm_candidates),
+            len(merged),
+        )
+        return merged

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -8,6 +7,10 @@ from typing import Any
 from core.constants import MemoryType, Scene
 from core.models import MemoryCandidate
 
+from .common import extractor_logger, slugify as _slugify, stable_candidate_id as _shared_stable_candidate_id
+
+
+logger = extractor_logger(__name__)
 
 _SENSITIVE_TOKENS = ("password", "passwd", "secret", "token", "api_key", "access_key", "credential", "authorization")
 _DOWNLOAD_KEYS = {"downloads", "download", "download_dir", "downloads_dir", "download_path"}
@@ -19,14 +22,8 @@ _SOFTWARE_KEYS = {"installed_software", "installed_applications", "applications"
 _VERSION_KEYS = {"os_version", "system_version", "operating_system", "platform", "os", "system"}
 
 
-def _slugify(value: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", value.strip().lower())
-    return token.strip("_") or "environment"
-
-
 def _stable_candidate_id(user_id: str, key: str) -> str:
-    payload = f"{user_id}\x1f{MemoryType.ENVIRONMENT.value}\x1f{key}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:32]
+    return _shared_stable_candidate_id(user_id, MemoryType.ENVIRONMENT, key)
 
 
 def _walk(payload: Any, path: tuple[str, ...] = (), visited: set[int] | None = None) -> Iterator[tuple[tuple[str, ...], Any]]:
@@ -306,4 +303,6 @@ class EnvironmentExtractor:
                 )
             )
 
-        return [candidates[key] for key in sorted(candidates)]
+        result = [candidates[key] for key in sorted(candidates)]
+        logger.debug("environment.extract_from_tool_output fields=%d candidates=%d", len(output), len(result))
+        return result

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -9,6 +8,19 @@ from typing import Any, Iterable
 from core.constants import MemoryType, Scene
 from core.models import MemoryCandidate, MemoryEvent
 
+from .common import (
+    KNOWLEDGE_GUIDE_BASE_CONFIDENCE,
+    LOW_CONFIDENCE_FLOOR,
+    MAX_CANDIDATE_CONFIDENCE,
+    MIN_INFERRED_CONFIDENCE,
+    extractor_logger,
+    slugify as _shared_slugify,
+    stable_candidate_id as _shared_stable_candidate_id,
+    stable_hash_token,
+)
+
+
+logger = extractor_logger(__name__)
 _SENSITIVE_TOKENS = (
     "password",
     "passwd",
@@ -102,9 +114,7 @@ _TEMPLATE_DOMAIN_RULES = [
 
 
 def _slugify(text: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", text.strip().lower())
-    token = re.sub(r"_+", "_", token).strip("_")
-    return token or "knowledge"
+    return _shared_slugify(text, fallback="knowledge")
 
 
 def _is_sensitive_key(key: Any) -> bool:
@@ -120,8 +130,7 @@ def _redact_sensitive_text(text: str) -> str:
 
 def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
     """Return a deterministic candidate id for idempotent extraction output."""
-    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:32]
+    return _shared_stable_candidate_id(user_id, memory_type, key)
 
 
 def _text_fragments(payload: Any) -> list[str]:
@@ -270,7 +279,7 @@ def _completeness_score(*, has_input: bool, has_output: bool, has_content: bool,
         score += 0.1
     if has_metadata:
         score += 0.05
-    return min(score, 0.95)
+    return min(score, MAX_CANDIDATE_CONFIDENCE)
 
 
 def _extract_faq_candidates(event: MemoryEvent, text: str) -> list[MemoryCandidate]:
@@ -334,7 +343,7 @@ def _extract_guide_candidates(event: MemoryEvent, text: str) -> list[MemoryCandi
         content = text.strip()
     topic_seed = step_like[0] if step_like else steps[0]
     topic = _slugify(topic_seed[:24])
-    confidence = 0.72
+    confidence = KNOWLEDGE_GUIDE_BASE_CONFIDENCE
     if step_like:
         confidence += min(0.15, 0.03 * len(step_like))
     if len(steps) >= 3:
@@ -464,10 +473,10 @@ def _template_confidence(events: list[MemoryEvent]) -> float:
         if event.metadata:
             rich_events += 1
     richness = min(1.0, rich_events / (count * 4))
-    confidence = 0.55
+    confidence = MIN_INFERRED_CONFIDENCE
     confidence += min(0.18, 0.06 * max(0, count - 1))
     confidence += 0.18 * richness
-    return min(confidence, 0.95)
+    return min(confidence, MAX_CANDIDATE_CONFIDENCE)
 
 
 def _dedupe_candidates(candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
@@ -544,7 +553,7 @@ class KnowledgeExtractor:
                         key=f"knowledge.issue.{intent}.{tool_name}",
                         content=f"问题诊断：{detail}",
                         scenario=event.scenario,
-                        confidence=max(0.62, confidence - 0.08),
+                        confidence=max(LOW_CONFIDENCE_FLOOR, confidence - 0.08),
                         source="knowledge_tool_result",
                         source_events=[event.event_id],
                         source_summaries=[detail],
@@ -557,7 +566,9 @@ class KnowledgeExtractor:
                     )
                 )
 
-        return _dedupe_candidates([_ensure_event_context(candidate, event, source="knowledge_tool_result") for candidate in candidates])
+        result = _dedupe_candidates([_ensure_event_context(candidate, event, source="knowledge_tool_result") for candidate in candidates])
+        logger.debug("knowledge.extract_from_tool_result event_id=%s candidates=%d", event.event_id, len(result))
+        return result
 
     @staticmethod
     def extract_from_conversation(event: MemoryEvent) -> list[MemoryCandidate]:
@@ -566,7 +577,9 @@ class KnowledgeExtractor:
         candidates.extend(_extract_faq_candidates(event, text))
         candidates.extend(_extract_guide_candidates(event, text))
         candidates.extend(_extract_system_guide(event))
-        return _dedupe_candidates(candidates)
+        result = _dedupe_candidates(candidates)
+        logger.debug("knowledge.extract_from_conversation event_id=%s candidates=%d", event.event_id, len(result))
+        return result
 
     @staticmethod
     def extract_templates(events: list[MemoryEvent]) -> list[MemoryCandidate]:
@@ -586,7 +599,7 @@ class KnowledgeExtractor:
             confidence = _template_confidence(ordered_group)
             template_key = (
                 f"template.{domain}.{_slugify(structure_key)}."
-                f"{hashlib.sha256(text_key.encode('utf-8')).hexdigest()[:12]}"
+                f"{stable_hash_token(text_key)}"
             )
             candidates.append(
                 _make_candidate(
@@ -610,4 +623,6 @@ class KnowledgeExtractor:
                 )
             )
 
-        return _dedupe_candidates(candidates)
+        result = _dedupe_candidates(candidates)
+        logger.debug("knowledge.extract_templates events=%d candidates=%d", len(events), len(result))
+        return result

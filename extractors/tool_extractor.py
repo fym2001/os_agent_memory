@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import Counter, defaultdict, deque
@@ -10,6 +9,16 @@ from typing import Any
 from core.constants import EventType, MemoryType, Scene
 from core.models import MemoryCandidate, MemoryEvent
 
+from .common import (
+    MIN_INFERRED_CONFIDENCE,
+    TOOL_PATTERN_MAX_CONFIDENCE,
+    extractor_logger,
+    slugify as _slugify,
+    stable_candidate_id as _stable_candidate_id,
+)
+
+
+logger = extractor_logger(__name__)
 
 _CORRELATION_KEYS = ("tool_call_id", "call_id", "invocation_id", "request_id", "trace_id", "run_id")
 _DURATION_KEYS = ("duration_ms", "latency_ms", "elapsed_ms", "response_time_ms", "execution_time_ms")
@@ -28,16 +37,6 @@ class _ToolInvocation:
     duration_ms: float | None
     failure_reason: str | None
     parameters: tuple[tuple[str, str], ...]
-
-
-def _slugify(value: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", value.strip().lower())
-    return token.strip("_") or "tool"
-
-
-def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
-    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:32]
 
 
 def _normalise_tool_name(event: MemoryEvent) -> str:
@@ -251,7 +250,14 @@ class ToolExtractor:
         """
         normalized_tool = tool_name.strip().lower()
         invocations = [item for item in _build_invocations(events) if item.tool_name == normalized_tool]
-        return _success_rate(invocations)
+        rate = _success_rate(invocations)
+        logger.debug(
+            "ToolExtractor.calculate_tool_success_rate tool=%s invocations=%d success_rate=%.4f",
+            normalized_tool,
+            len(invocations),
+            rate,
+        )
+        return rate
 
     @staticmethod
     def extract_tool_pattern(events: list[MemoryEvent]) -> list[MemoryCandidate]:
@@ -299,7 +305,7 @@ class ToolExtractor:
                     key=key,
                     content="；".join(content_parts),
                     scenario=scenario,
-                    confidence=round(min(0.98, 0.55 + 0.45 * completeness), 4),
+                    confidence=round(min(TOOL_PATTERN_MAX_CONFIDENCE, MIN_INFERRED_CONFIDENCE + 0.45 * completeness), 4),
                     source="tool_pattern",
                     source_events=event_ids,
                     source_summaries=[f"{tool_name}: {item.success}" for item in invocations],
@@ -320,4 +326,10 @@ class ToolExtractor:
                     },
                 )
             )
+        logger.debug(
+            "ToolExtractor.extract_tool_pattern events=%d tool_groups=%d candidates=%d",
+            len(events),
+            len(by_user_tool),
+            len(candidates),
+        )
         return candidates

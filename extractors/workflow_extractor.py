@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from collections import defaultdict
 from typing import Any, Iterable
@@ -8,6 +7,16 @@ from typing import Any, Iterable
 from core.constants import EventType, MemoryType, Scene
 from core.models import MemoryCandidate, MemoryEvent
 
+from .common import (
+    MAX_CANDIDATE_CONFIDENCE,
+    WORKFLOW_BASE_CONFIDENCE,
+    extractor_logger,
+    slugify as _shared_slugify,
+    stable_candidate_id as _shared_stable_candidate_id,
+)
+
+
+logger = extractor_logger(__name__)
 
 _WORKFLOW_TEXT_MARKERS = (
     "workflow",
@@ -79,14 +88,11 @@ _STEP_RE = re.compile(r"^(?:\d+[.)、-]|step\s*\d+|步骤\s*\d+)", re.IGNORECASE
 
 
 def _slugify(text: str) -> str:
-    token = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", text.strip().lower())
-    token = re.sub(r"_+", "_", token).strip("_")
-    return token or "workflow"
+    return _shared_slugify(text, fallback="workflow")
 
 
 def _stable_candidate_id(user_id: str, memory_type: MemoryType, key: str) -> str:
-    payload = f"{user_id}\x1f{memory_type.value}\x1f{key}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:32]
+    return _shared_stable_candidate_id(user_id, memory_type, key)
 
 
 def _normalize_text(value: Any) -> str:
@@ -328,12 +334,12 @@ def _workflow_content(prefix: str, groups: list[list[MemoryEvent]], dependencies
 
 
 def _workflow_confidence(group_count: int, dependency_count: int, complex_flow: bool) -> float:
-    confidence = 0.62
+    confidence = WORKFLOW_BASE_CONFIDENCE
     confidence += min(0.12, 0.04 * max(0, group_count - 2))
     confidence += min(0.12, 0.06 * dependency_count)
     if complex_flow:
         confidence += 0.08
-    return min(confidence, 0.95)
+    return min(confidence, MAX_CANDIDATE_CONFIDENCE)
 
 
 def _workflow_reproduction_rate(groups: list[list[MemoryEvent]], dependencies: list[dict[str, Any]]) -> tuple[float, dict[str, float]]:
@@ -483,7 +489,13 @@ def _dedupe_candidates(candidates: list[MemoryCandidate]) -> list[MemoryCandidat
 class WorkflowExtractor:
     @staticmethod
     def detect_workflow_boundary(events: list[MemoryEvent]) -> list[tuple[int, int]]:
-        return _workflow_boundaries_with_indices(events)
+        boundaries = _workflow_boundaries_with_indices(events)
+        logger.debug(
+            "WorkflowExtractor.detect_workflow_boundary events=%d boundaries=%d",
+            len(events),
+            len(boundaries),
+        )
+        return boundaries
 
     @staticmethod
     def extract_tool_sequence(events: list[MemoryEvent]) -> list[MemoryCandidate]:
@@ -492,7 +504,14 @@ class WorkflowExtractor:
             for start, end in _workflow_boundaries_with_indices(group_events):
                 segment = group_events[start : end + 1]
                 candidates.extend(_extract_candidates_from_segment(segment, mode="tool_sequence"))
-        return _dedupe_candidates(candidates)
+        deduped = _dedupe_candidates(candidates)
+        logger.debug(
+            "WorkflowExtractor.extract_tool_sequence events=%d raw_candidates=%d deduped=%d",
+            len(events),
+            len(candidates),
+            len(deduped),
+        )
+        return deduped
 
     @staticmethod
     def extract_multi_step_workflow(session_events: list[MemoryEvent]) -> list[MemoryCandidate]:
@@ -501,4 +520,11 @@ class WorkflowExtractor:
             for start, end in _workflow_boundaries_with_indices(group_events):
                 segment = group_events[start : end + 1]
                 candidates.extend(_extract_candidates_from_segment(segment, mode="multi_step"))
-        return _dedupe_candidates(candidates)
+        deduped = _dedupe_candidates(candidates)
+        logger.debug(
+            "WorkflowExtractor.extract_multi_step_workflow events=%d raw_candidates=%d deduped=%d",
+            len(session_events),
+            len(candidates),
+            len(deduped),
+        )
+        return deduped
