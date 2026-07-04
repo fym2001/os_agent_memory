@@ -1,4 +1,3 @@
-
 """
 API 请求/响应数据模型
 
@@ -164,6 +163,9 @@ class ExtractionResponse(BaseModel):
     candidates: list[CandidateItem] = Field(default_factory=list)
     saved_memory_ids: list[str] = Field(default_factory=list)
 
+    # intent analysis will be populated by routes to help agent decision making
+    intent_analysis: "IntentAnalysis" | None = None
+
 
 # =========================
 # POST /memory/retrieve
@@ -232,6 +234,8 @@ class RetrievalResponse(BaseModel):
     retrieval_mode: RetrievalMode
     latency_ms: float | None = None
 
+    intent_analysis: "IntentAnalysis" | None = None
+
 
 # =========================
 # POST /memory/forget
@@ -279,6 +283,8 @@ class ForgetResponse(BaseModel):
 
     log_id: str | None = None
 
+    intent_analysis: "IntentAnalysis" | None = None
+
 
 # =========================
 # GET /memory/health
@@ -293,3 +299,12 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     timestamp: datetime = Field(default_factory=datetime.now)
 
+
+# IntentAnalysis Pydantic model (placed at bottom to avoid forward ref issues)
+class IntentAnalysis(BaseModel):
+    need_history: bool = False
+    involves_preferences: bool = False
+    involves_security: bool = False
+    involves_forget: bool = False
+    intents: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
