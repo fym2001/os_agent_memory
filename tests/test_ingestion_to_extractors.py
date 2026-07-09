@@ -1,105 +1,116 @@
 from __future__ import annotations
 
-from ingestion.adapter import raw_event_to_memory_event
-from ingestion.collector import create_raw_event
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+import pytest
+
+from core.constants import EventType, MemoryType, Scene
+from core.models import MemoryEvent
 from extractors.environment_extractor import EnvironmentExtractor
 from extractors.knowledge_extractor import KnowledgeExtractor
+from extractors.llm_memory_extractor import clear_default_llm_client, set_default_llm_client
 from extractors.preference_extractor import PreferenceExtractor
 from extractors.tool_extractor import ToolExtractor
 
 
-def _memory_event(payload: dict):
-    return raw_event_to_memory_event(create_raw_event(payload))
+class IntegrationFakeLLMClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def complete_json(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        request = json.loads(prompt)
+        self.calls.append({"request": request, "schema": schema})
+        mode = request["mode"]
+        if mode.startswith("preference"):
+            return _payload("preference", "output_format", "markdown", "用户偏好 Markdown")
+        if mode.startswith("knowledge"):
+            return _payload("knowledge", "tool_case", "export_pdf", "PDF 导出工具结果可复用")
+        if mode.startswith("tool"):
+            return _payload("tool", "experience", "export_pdf", "export_pdf 工具适合文档导出")
+        if mode.startswith("environment"):
+            return _payload("environment", "path", "documents", "常用文档目录是 /root/docs")
+        return {"candidates": []}
 
 
-def test_ingestion_conversation_event_feeds_preference_extractor() -> None:
-    event = _memory_event(
-        {
-            "event_id": "raw-pref-1",
-            "user_id": "user-a",
-            "session_id": "session-a",
-            "task_id": "task-a",
-            "event_type": "conversation",
-            "scenario": "office",
-            "timestamp": "2026-06-27T10:00:00+08:00",
-            "content": "以后都用 Markdown 输出，回答尽量简洁。",
-        }
+def _payload(memory_type: str, category: str, value: str, content: str) -> dict[str, Any]:
+    return {
+        "candidates": [
+            {
+                "is_memory_worthy": True,
+                "is_long_term": True,
+                "memory_type": memory_type,
+                "category": category,
+                "value": value,
+                "scope": "integration",
+                "content": content,
+                "confidence": 0.84,
+                "evidence": "fake integration evidence",
+                "reason": "fake integration reason",
+                "sensitivity": "none",
+            }
+        ]
+    }
+
+
+@pytest.fixture()
+def integration_client() -> IntegrationFakeLLMClient:
+    client = IntegrationFakeLLMClient()
+    set_default_llm_client(client)
+    try:
+        yield client
+    finally:
+        clear_default_llm_client()
+
+
+def _event(event_id: str, event_type: EventType, **kwargs: Any) -> MemoryEvent:
+    return MemoryEvent(
+        event_id=event_id,
+        raw_event_id=f"raw-{event_id}",
+        user_id="u-ingest",
+        session_id="s-ingest",
+        task_id="t-ingest",
+        event_type=event_type,
+        scenario=Scene.OFFICE,
+        source=event_type.value,
+        actor="user",
+        timestamp=datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc),
+        **kwargs,
     )
+
+
+def test_ingestion_output_can_drive_preference_llm_extractor(integration_client: IntegrationFakeLLMClient) -> None:
+    event = _event(EventType.CONVERSATION.value, EventType.CONVERSATION, content="以后文档用 Markdown 输出")
 
     candidates = PreferenceExtractor.extract_from_conversation(event)
-    keys = {candidate.key for candidate in candidates}
 
-    assert "preference.output_format.markdown" in keys
-    assert all(candidate.user_id == "user-a" for candidate in candidates)
-    assert all("raw-pref-1" in candidate.source_events for candidate in candidates)
+    assert integration_client.calls[0]["request"]["events"][0]["event_id"] == EventType.CONVERSATION.value
+    assert candidates[0].memory_type is MemoryType.PREFERENCE
 
 
-def test_ingestion_tool_events_feed_knowledge_and_tool_extractors() -> None:
-    call_event = _memory_event(
-        {
-            "event_id": "raw-tool-call-1",
-            "user_id": "user-a",
-            "session_id": "session-a",
-            "task_id": "task-a",
-            "event_type": "tool_call",
-            "scenario": "office",
-            "timestamp": "2026-06-27T10:01:00+08:00",
-            "tool_name": "wps_export",
-            "input": {"file": "report.docx", "format": "pdf"},
-            "call_id": "call-1",
-        }
-    )
-    result_event = _memory_event(
-        {
-            "event_id": "raw-tool-result-1",
-            "user_id": "user-a",
-            "session_id": "session-a",
-            "task_id": "task-a",
-            "event_type": "tool_result",
-            "scenario": "office",
-            "timestamp": "2026-06-27T10:01:03+08:00",
-            "tool_name": "wps_export",
-            "output": {"file": "report.pdf", "status": "success"},
-            "success": True,
-            "duration_ms": 3000,
-            "call_id": "call-1",
-        }
+def test_tool_result_event_can_drive_knowledge_and_tool_llm_extractors(integration_client: IntegrationFakeLLMClient) -> None:
+    event = _event(
+        "tool-result",
+        EventType.TOOL_RESULT,
+        tool_name="export_pdf",
+        output={"status": "success", "file": "report.pdf"},
+        success=True,
     )
 
-    knowledge = KnowledgeExtractor.extract_from_tool_result(result_event)
-    tool_patterns = ToolExtractor.extract_tool_pattern([call_event, result_event])
+    knowledge = KnowledgeExtractor.extract_from_tool_result(event)
+    tool_memory = ToolExtractor.extract_tool_pattern([event])
 
-    assert knowledge
-    assert any(candidate.key == "knowledge.tool_case.batch_export.wps_export" for candidate in knowledge)
-    assert len(tool_patterns) == 1
-    assert tool_patterns[0].metadata["success_rate"] == 1.0
-    assert tool_patterns[0].metadata["success_count"] == 1
+    assert knowledge[0].memory_type is MemoryType.KNOWLEDGE
+    assert tool_memory[0].memory_type is MemoryType.TOOL
+    assert [call["request"]["mode"] for call in integration_client.calls] == [
+        "knowledge_from_tool_result",
+        "tool_pattern",
+    ]
 
 
-def test_ingestion_system_context_event_feeds_environment_extractor() -> None:
-    event = _memory_event(
-        {
-            "event_id": "raw-env-1",
-            "user_id": "user-a",
-            "session_id": "session-a",
-            "task_id": "task-a",
-            "event_type": "system_context",
-            "scenario": "system",
-            "timestamp": "2026-06-27T10:02:00+08:00",
-            "downloads": "C:\\Users\\alice\\Downloads",
-            "documents": "C:\\Users\\alice\\Documents",
-            "locale": "zh_CN",
-            "installed_software": ["WPS Office", "Python"],
-            "os_version": "Kylin Desktop V11",
-        }
-    )
+def test_environment_metadata_can_drive_environment_llm_extractor(integration_client: IntegrationFakeLLMClient) -> None:
+    candidates = EnvironmentExtractor.extract_from_tool_output({"user_id": "u-ingest", "documents": "/root/docs"})
 
-    candidates = EnvironmentExtractor.extract_from_tool_output(event.metadata)
-    keys = {candidate.key for candidate in candidates}
-
-    assert "environment.path.downloads" in keys
-    assert "environment.path.documents" in keys
-    assert "environment.locale.language" in keys
-    assert "environment.locale.region" in keys
-    assert any(candidate.key.startswith("environment.software.") for candidate in candidates)
-    assert any(candidate.metadata.get("path") == "~\\Downloads" for candidate in candidates)
+    assert candidates[0].memory_type is MemoryType.ENVIRONMENT
+    assert integration_client.calls[0]["request"]["events"][0]["event_type"] == "system_context"

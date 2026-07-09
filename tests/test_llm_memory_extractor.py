@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,9 +11,10 @@ from extractors.llm_memory_extractor import (
     CandidateValidator,
     HybridMemoryExtractor,
     LLMMemoryExtractor,
+    LLMWorkflowBoundaryExtractor,
+    clear_default_llm_client,
     should_call_llm,
 )
-from extractors.preference_extractor import PreferenceExtractor
 
 
 class FakeLLMClient:
@@ -21,7 +23,7 @@ class FakeLLMClient:
         self.calls: list[dict[str, Any]] = []
 
     def complete_json(self, prompt: str, schema: dict[str, Any]) -> Any:
-        self.calls.append({"prompt": prompt, "schema": schema})
+        self.calls.append({"prompt": prompt, "schema": schema, "request": json.loads(prompt)})
         return self.payload
 
 
@@ -53,11 +55,11 @@ def _event(
         output=output_payload or {},
         metadata=metadata or {},
         success=success,
-        timestamp=datetime(2026, 7, 3, 10, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc),
     )
 
 
-def _llm_payload(
+def _payload(
     *,
     memory_type: str = "preference",
     category: str = "response_order",
@@ -78,65 +80,54 @@ def _llm_payload(
                 "scope": "report_writing",
                 "content": content,
                 "confidence": confidence,
-                "evidence": "这种报告还是先给结论好一点",
-                "reason": "用户表达了可复用的后续报告写作偏好",
+                "evidence": "这种报告以后先给结论再展开。",
+                "reason": "LLM 判断这是可复用的长期写作偏好。",
                 "sensitivity": "none",
             }
         ]
     }
 
 
-def test_hybrid_uses_llm_for_semantic_preference_without_rule_hit() -> None:
-    event = _event("evt-llm-1", content="这种报告还是先给结论好一点，再展开细节。")
-    client = FakeLLMClient(_llm_payload())
+def test_llm_prompt_contains_sanitized_input_dataset_before_model_output() -> None:
+    event = _event(
+        "evt-before-after-1",
+        content="以后报告先给结论。api_key=sk-secret-1234567890",
+        metadata={"email": "alice@example.com", "api_key": "sk-secret-1234567890"},
+    )
+    client = FakeLLMClient(_payload())
+
+    candidates = LLMMemoryExtractor.extract_event(event, client, mode="conversation")
+
+    assert candidates[0].key == "preference.response_order.conclusion_first"
+    prompt = client.calls[0]["prompt"]
+    request = client.calls[0]["request"]
+    assert request["mode"] == "conversation"
+    assert request["events"][0]["event_id"] == "evt-before-after-1"
+    assert "sk-secret-1234567890" not in prompt
+    assert "alice@example.com" not in prompt
+    assert "[REDACTED_SECRET]" in prompt
+    assert "[REDACTED_EMAIL]" in prompt
+
+
+def test_hybrid_facade_always_uses_llm_when_client_is_supplied() -> None:
+    event = _event("evt-llm-2", content="以后都用 Markdown 输出。")
+    client = FakeLLMClient(_payload(category="output_format", value="markdown", content="用户偏好 Markdown 输出"))
 
     candidates = HybridMemoryExtractor.extract_from_conversation(event, client)
 
     assert client.calls
-    assert any(candidate.key == "preference.response_order.conclusion_first" for candidate in candidates)
-    selected = next(candidate for candidate in candidates if candidate.key == "preference.response_order.conclusion_first")
-    assert selected.memory_type is MemoryType.PREFERENCE
-    assert selected.source == "llm_extracted"
-    assert selected.metadata["extraction_method"] == "llm_semantic"
-    assert selected.metadata["scope"] == "report_writing"
-    assert event.event_id in selected.source_events
+    assert [candidate.key for candidate in candidates] == ["preference.output_format.markdown"]
+    assert candidates[0].source == "llm_extracted"
 
 
-def test_hybrid_skips_llm_for_high_confidence_rule_hit() -> None:
-    event = _event("evt-llm-2", content="以后都用 Markdown 输出。")
-    client = FakeLLMClient(_llm_payload(value="pdf", content="用户偏好 PDF"))
-
-    candidates = HybridMemoryExtractor.extract_from_conversation(event, client)
-
-    assert client.calls == []
-    assert any(candidate.key == "preference.output_format.markdown" for candidate in candidates)
-    assert not any(candidate.key == "preference.response_order.pdf" for candidate in candidates)
+def test_should_call_llm_has_no_rule_or_length_gate() -> None:
+    assert should_call_llm(_event("evt-empty", content="")) is False
+    assert should_call_llm(_event("evt-short", content="好")) is True
+    assert should_call_llm(_event("evt-tool", event_type=EventType.TOOL_RESULT, tool_name="export", output_payload={"ok": True})) is True
 
 
-def test_candidate_merger_deduplicates_and_boosts_rule_llm_agreement() -> None:
-    event = _event("evt-llm-3", content="以后都用 Markdown 输出。")
-    rule_candidate = PreferenceExtractor.extract_from_conversation(event)[0]
-    client = FakeLLMClient(
-        _llm_payload(
-            category="output_format",
-            value="markdown",
-            content="用户偏好以后使用 Markdown 输出",
-            confidence=0.87,
-        )
-    )
-    llm_candidate = LLMMemoryExtractor.extract_event(event, client)[0]
-
-    merged = CandidateMerger.merge([rule_candidate], [llm_candidate])
-
-    assert len([candidate for candidate in merged if candidate.key == "preference.output_format.markdown"]) == 1
-    selected = next(candidate for candidate in merged if candidate.key == "preference.output_format.markdown")
-    assert selected.source == "hybrid"
-    assert selected.confidence > rule_candidate.confidence
-    assert selected.metadata["corroborated_by_rule_and_llm"] is True
-
-
-def test_llm_rejects_transient_and_credential_like_memory() -> None:
-    event = _event("evt-llm-4", content="这次临时用 PDF，api_key=sk-1234567890abcdef1234567890abcdef。")
+def test_validator_rejects_temporary_and_credential_like_candidates() -> None:
+    event = _event("evt-llm-4", content="这次临时用 PDF，api_key=sk-1234567890abcdef。")
     client = FakeLLMClient(
         {
             "candidates": [
@@ -150,7 +141,7 @@ def test_llm_rejects_transient_and_credential_like_memory() -> None:
                     "content": "用户这次临时使用 PDF",
                     "confidence": 0.9,
                     "evidence": "这次临时用 PDF",
-                    "reason": "当前任务约束，不是长期偏好",
+                    "reason": "当前任务约束，不是长期偏好。",
                     "sensitivity": "none",
                 },
                 {
@@ -160,10 +151,10 @@ def test_llm_rejects_transient_and_credential_like_memory() -> None:
                     "category": "credential",
                     "value": "api_key",
                     "scope": "tool_runtime",
-                    "content": "用户 API_KEY 是 sk-1234567890abcdef1234567890abcdef",
+                    "content": "用户 API_KEY 是 sk-1234567890abcdef",
                     "confidence": 0.88,
-                    "evidence": "api_key=sk-1234567890abcdef1234567890abcdef",
-                    "reason": "包含凭据，不应进入长期记忆",
+                    "evidence": "api_key=sk-1234567890abcdef",
+                    "reason": "包含凭据，不应进入长期记忆。",
                     "sensitivity": "api_key",
                 },
             ]
@@ -176,73 +167,7 @@ def test_llm_rejects_transient_and_credential_like_memory() -> None:
     assert "sk-1234567890abcdef" not in client.calls[0]["prompt"]
 
 
-def test_llm_session_can_emit_workflow_with_provenance() -> None:
-    events = [
-        _event("evt-llm-5", content="这种月报流程以后可以复用。"),
-        _event(
-            "evt-llm-6",
-            event_type=EventType.TOOL_CALL,
-            source="tool_call",
-            tool_name="read_spreadsheet",
-            input_payload={"file": "sales.xlsx"},
-        ),
-        _event(
-            "evt-llm-7",
-            event_type=EventType.TOOL_RESULT,
-            source="tool_result",
-            tool_name="export_report",
-            output_payload={"file": "report.pdf", "status": "success"},
-        ),
-    ]
-    client = FakeLLMClient(
-        _llm_payload(
-            memory_type="workflow",
-            category="monthly_report",
-            value="read_generate_export",
-            content="月报流程：读取数据 -> 生成报告 -> 导出 PDF",
-            confidence=0.86,
-        )
-    )
-
-    candidates = HybridMemoryExtractor.extract_from_session(events, client)
-
-    workflow = next(candidate for candidate in candidates if candidate.key == "workflow.monthly_report.read_generate_export")
-    assert workflow.memory_type is MemoryType.WORKFLOW
-    assert workflow.metadata["provenance"][0]["event_id"] == "evt-llm-5"
-    assert workflow.source_events == ["evt-llm-5", "evt-llm-6", "evt-llm-7"]
-
-
-def test_tool_result_long_output_can_use_llm_semantic_layer() -> None:
-    event = _event(
-        "evt-llm-8",
-        event_type=EventType.TOOL_RESULT,
-        source="tool_result",
-        tool_name="merge_files",
-        input_payload={"files": ["a.csv", "b.csv"], "mode": "dedupe"},
-        output_payload={
-            "status": "success",
-            "summary": "merged two files, removed duplicate rows, exported final_report.csv",
-            "rows": 1200,
-            "note": "这个流程以后可以作为合并文件模板复用。" * 4,
-        },
-    )
-    client = FakeLLMClient(
-        _llm_payload(
-            memory_type="template",
-            category="data_processing",
-            value="merge_files_dedupe",
-            content="合并文件模板：读取多个 CSV -> 去重 -> 导出结果文件",
-            confidence=0.82,
-        )
-    )
-
-    candidates = HybridMemoryExtractor.extract_from_tool_result(event, client)
-
-    assert client.calls
-    assert any(candidate.key == "template.data_processing.merge_files_dedupe" for candidate in candidates)
-
-
-def test_validator_redacts_personal_contact_but_keeps_safety_candidate() -> None:
+def test_validator_redacts_contact_information_without_changing_extraction_logic() -> None:
     candidate = MemoryCandidate(
         candidate_id="contact-1",
         user_id="user-llm",
@@ -260,61 +185,11 @@ def test_validator_redacts_personal_contact_but_keeps_safety_candidate() -> None
     assert checked is not None
     assert "[REDACTED_PHONE]" in checked.content
     assert "[REDACTED_EMAIL]" in checked.content
-    assert checked.confidence == 0.72
+    assert checked.confidence == 0.91
     assert checked.metadata["sensitive_redacted"] is True
 
 
-def test_llm_payload_parser_handles_empty_invalid_and_list_shapes() -> None:
-    assert LLMMemoryExtractor.extract_events([], FakeLLMClient(_llm_payload())) == []
-
-    event = _event("evt-llm-9", content="以后按报告模板整理。")
-    client = FakeLLMClient(
-        [
-            {
-                "is_memory_worthy": True,
-                "is_long_term": True,
-                "memory_type": "not_a_type",
-                "category": "x",
-                "content": "invalid type",
-                "confidence": "not-a-number",
-                "evidence": "",
-                "reason": "",
-            },
-            {
-                "is_memory_worthy": True,
-                "is_long_term": True,
-                "memory_type": "preference",
-                "category": "workflow",
-                "value": "report_template",
-                "content": "用户偏好报告按模板整理",
-                "confidence": "bad-score",
-                "evidence": "",
-                "reason": "",
-            },
-        ]
-    )
-
-    candidates = LLMMemoryExtractor.extract_event(event, client)
-
-    assert len(candidates) == 1
-    assert candidates[0].key == "preference.workflow.report_template"
-    assert round(candidates[0].confidence, 2) == 0.57
-
-
-def test_should_call_llm_handles_empty_and_special_event_types() -> None:
-    empty = _event("evt-llm-10", content="")
-    assert should_call_llm(empty, []) is False
-
-    feedback = _event(
-        "evt-llm-11",
-        event_type=EventType.USER_FEEDBACK,
-        source="feedback",
-        content="这个流程以后不要再这样处理。",
-    )
-    assert should_call_llm(feedback, []) is True
-
-
-def test_merger_annotates_possible_conflicts_in_same_category() -> None:
+def test_merger_deduplicates_and_marks_conflicts_without_rule_boosting() -> None:
     left = MemoryCandidate(
         candidate_id="pref-1",
         user_id="user-llm",
@@ -326,7 +201,18 @@ def test_merger_annotates_possible_conflicts_in_same_category() -> None:
         source="llm_extracted",
         metadata={"evidence": "以后用 Markdown"},
     )
-    right = MemoryCandidate(
+    better_duplicate = MemoryCandidate(
+        candidate_id="pref-1b",
+        user_id="user-llm",
+        memory_type=MemoryType.PREFERENCE,
+        key="preference.output_format.markdown",
+        content="用户强烈偏好 Markdown",
+        scenario=Scene.OFFICE,
+        confidence=0.9,
+        source="llm_extracted",
+        metadata={"evidence": "默认用 Markdown"},
+    )
+    conflict = MemoryCandidate(
         candidate_id="pref-2",
         user_id="user-llm",
         memory_type=MemoryType.PREFERENCE,
@@ -338,8 +224,97 @@ def test_merger_annotates_possible_conflicts_in_same_category() -> None:
         metadata={"evidence": "以后用 PDF"},
     )
 
-    merged = CandidateMerger.merge([left], [right])
+    merged = CandidateMerger.merge([left], [better_duplicate, conflict])
 
     assert len(merged) == 2
+    markdown = next(candidate for candidate in merged if candidate.key.endswith("markdown"))
+    assert markdown.content == "用户强烈偏好 Markdown"
     for candidate in merged:
         assert candidate.metadata["possible_conflict_keys"]
+
+
+def test_workflow_boundaries_are_model_output_not_local_markers() -> None:
+    events = [
+        _event("evt-0", content="开始处理月报"),
+        _event("evt-1", event_type=EventType.TOOL_RESULT, tool_name="read_sheet", output_payload={"rows": 20}),
+        _event("evt-2", event_type=EventType.TOOL_RESULT, tool_name="export_pdf", output_payload={"file": "report.pdf"}),
+    ]
+    client = FakeLLMClient({"boundaries": [{"start": 0, "end": 2, "reason": "同一月报流程"}]})
+
+    assert LLMWorkflowBoundaryExtractor.detect_boundaries(events, client) == [(0, 2)]
+
+
+def test_llm_parser_handles_empty_events_inactive_events_invalid_types_and_list_shape() -> None:
+    client = FakeLLMClient([])
+    assert LLMMemoryExtractor.extract_events([], client) == []
+    assert LLMMemoryExtractor.extract_event(_event("evt-inactive"), client) == []
+
+    event = _event("evt-list", content="以后报告按模板整理")
+    client = FakeLLMClient(
+        [
+            {
+                "is_memory_worthy": True,
+                "is_long_term": True,
+                "memory_type": "not_a_type",
+                "category": "x",
+                "value": "x",
+                "content": "invalid",
+                "confidence": 1,
+                "evidence": "invalid",
+                "reason": "invalid",
+            },
+            {
+                "is_memory_worthy": True,
+                "is_long_term": True,
+                "memory_type": "preference",
+                "category": "report_style",
+                "value": "template",
+                "content": "",
+                "confidence": 1,
+                "evidence": "empty",
+                "reason": "empty",
+            },
+            {
+                "is_memory_worthy": True,
+                "is_long_term": True,
+                "memory_type": "preference",
+                "category": "report_style",
+                "value": "template",
+                "content": "用户偏好按模板整理报告",
+                "confidence": "bad-score",
+                "evidence": "以后报告按模板整理",
+                "reason": "LLM 判断为长期偏好",
+            },
+        ]
+    )
+
+    candidates = LLMMemoryExtractor.extract_event(event, client)
+
+    assert len(candidates) == 1
+    assert candidates[0].key == "preference.report_style.template"
+    assert candidates[0].confidence == 0.0
+
+
+def test_hybrid_facade_without_any_client_returns_empty_lists() -> None:
+    clear_default_llm_client()
+    event = _event("evt-no-client", content="以后先给结论")
+
+    assert HybridMemoryExtractor.extract_from_conversation(event) == []
+    assert HybridMemoryExtractor.extract_from_tool_result(event) == []
+    assert HybridMemoryExtractor.extract_from_session([event]) == []
+
+
+def test_boundary_parser_ignores_invalid_model_items() -> None:
+    events = [_event("evt-boundary-0", content="开始"), _event("evt-boundary-1", content="结束")]
+    client = FakeLLMClient(
+        {
+            "boundaries": [
+                {"start": 0, "end": 1, "reason": "valid"},
+                {"start": 1, "end": 5, "reason": "out of range"},
+                {"start": "bad", "end": 1, "reason": "bad"},
+                "bad",
+            ]
+        }
+    )
+
+    assert LLMWorkflowBoundaryExtractor.detect_boundaries(events, client) == [(0, 1)]

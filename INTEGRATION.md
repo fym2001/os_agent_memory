@@ -2,68 +2,115 @@
 
 ## Shared boundary
 
-The extractors consume `core.models.MemoryEvent` and return
+The B-side extractors consume `core.models.MemoryEvent` and return
 `core.models.MemoryCandidate`. They do not alter `core/constants.py`,
 `core/models.py`, or the Phase 0 SQLite schema.
 
-The B-side extractors are compatible with A-side events produced by
-`ingestion.collector.create_raw_event()` followed by
-`ingestion.adapter.raw_event_to_memory_event()`.
+The A-to-B contract is:
 
-Callers must provide a non-empty `user_id`, `session_id`, and `task_id` for
-tenant isolation and concurrent task separation. Timestamps must be UTC or
-timezone-aware values accepted by `MemoryEvent`.
-
-## Extractor semantics
-
-- `PreferenceExtractor` and `KnowledgeExtractor` emit user-scoped candidates.
-  Template evidence is never aggregated across users.
-- `WorkflowExtractor` groups by `(user_id, session_id, task_id)` and orders
-  events by `(timestamp, event_id)` before deriving a workflow. A workflow is
-  emitted only when its evidence-based `metadata.reproduction_rate` is at
-  least `0.8`. Repeated identical workflows merge evidence into
-  `metadata.occurrence_count` rather than dropping later observations.
-- `ToolExtractor.calculate_tool_success_rate()` uses
-  `success_count / completed_invocation_count`. Calls without terminal results
-  are exposed as `unknown_count` and excluded from the denominator, preventing
-  incomplete telemetry from being reported as failures.
-- `EnvironmentExtractor.extract_from_tool_output()` accepts a dictionary.
-  It supports common keys such as `downloads`, `documents`, `locale`,
-  `installed_software`, `applications`, and `os_version`. Home-directory
-  usernames in paths are normalised to `~`; credential-like keys are ignored.
-
-`MemoryCandidate.key` and `candidate_id` are deterministic for an identical
-user/type/key input. The downstream storage owner remains responsible for
-upserting records by the candidate key or another approved identity rule.
-
-## Optional LLM semantic layer
-
-The rule-based B extractors remain the stable Phase 1 baseline.  For the next
-stage, `extractors.llm_memory_extractor` adds an optional LLM-enhanced pipeline
-inspired by LangMem, Mem0, and Graphiti design ideas:
-
-- rule extractors provide deterministic baseline candidates;
-- an injected JSON-capable LLM client can add semantic candidates for complex
-  preference, knowledge, workflow, and session-level memory extraction;
-- `CandidateValidator` filters temporary instructions, rejects credential-like
-  content, redacts common sensitive values, and adjusts confidence;
-- `CandidateMerger` de-duplicates rule/LLM candidates, boosts candidates
-  corroborated by both paths, and annotates possible conflicts.
-
-This layer is additive.  It does not change the original extractor method
-signatures, core data models, constants, or Phase 0 SQLite schema.  It has no
-runtime dependency on a specific LLM SDK; production callers must inject an
-adapter implementing `complete_json(prompt, schema)`.  Tests use a fake client.
-
-## Verification
-
-Runtime code uses only the standard library. For development tests:
-
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest tests -v
-python -m coverage run -m pytest tests -q
-python -m coverage report -m
+```text
+Raw payload
+  -> ingestion.collector.create_raw_event(...)
+  -> ingestion.adapter.raw_event_to_memory_event(...)
+  -> B-side extractor
+  -> MemoryCandidate[]
 ```
 
-Validated locally with Python 3.13.5, pytest 8.3.4, and coverage 7.14.3.
+Callers should provide `user_id`, `session_id`, and `task_id` for tenant
+isolation and concurrent task separation. Timestamps must be UTC or
+timezone-aware values accepted by `MemoryEvent`.
+
+## B-side extractor semantics
+
+The public class and method names remain compatible with the Phase 1 task
+schedule:
+
+- `PreferenceExtractor`
+- `KnowledgeExtractor`
+- `WorkflowExtractor`
+- `ToolExtractor`
+- `EnvironmentExtractor`
+
+The implementation is now LLM-only for memory extraction. These classes do not
+use regex templates, keyword lists, frequency counters, event-type shortcuts,
+text-length thresholds, or locally computed confidence gates to decide what
+memory should be extracted.
+
+All semantic extraction is delegated to a configured JSON-capable LLM adapter:
+
+```python
+from extractors.llm_memory_extractor import set_default_llm_client
+
+set_default_llm_client(client)  # client.complete_json(prompt, schema) -> JSON
+```
+
+If no LLM client is configured, legacy static methods return empty results
+rather than silently falling back to hardcoded extraction rules. This keeps
+failure behavior explicit for integration and evaluation.
+
+## Pipeline
+
+```text
+MemoryEvent / MemoryEvent[]
+        |
+        v
+Prompt payload packaging and secret/contact redaction
+        |
+        v
+LLMJsonClient.complete_json(prompt, schema)
+        |
+        v
+LLM structured JSON
+        |
+        v
+CandidateValidator
+        |
+        v
+CandidateMerger
+        |
+        v
+MemoryCandidate[]
+```
+
+Local post-processing is limited to engineering boundaries:
+
+- prompt packaging from `MemoryEvent`;
+- credential/contact redaction before prompt and after model output;
+- JSON/schema conversion into `MemoryCandidate`;
+- empty/non-long-term candidate filtering based on model output flags;
+- duplicate merging and conflict annotation for already-produced candidates.
+
+It is not a rule-based memory extractor.
+
+## A-side integration verification
+
+The test `tests/test_ingestion_to_extractors.py` verifies that ingestion-style
+`MemoryEvent` objects can directly drive B-side LLM extractors for:
+
+- preference extraction from conversation events;
+- knowledge/tool extraction from tool result events;
+- environment extraction from metadata/tool-output dictionaries.
+
+The test uses a fake LLM client, so it is deterministic and does not require a
+network connection, API key, or model download.
+
+## Verification commands
+
+Targeted B-side verification:
+
+```powershell
+python -m pytest tests/test_extractors.py tests/test_llm_memory_extractor.py tests/test_environment_extractor.py tests/test_tool_extractor.py tests/test_workflow_extractor.py tests/test_ingestion_to_extractors.py -q
+```
+
+Coverage:
+
+```powershell
+python -m coverage run -m pytest tests/test_extractors.py tests/test_llm_memory_extractor.py tests/test_environment_extractor.py tests/test_tool_extractor.py tests/test_workflow_extractor.py tests/test_ingestion_to_extractors.py -q
+python -m coverage report -m --include="extractors/*"
+```
+
+Dataset input/output demo:
+
+```powershell
+python demo\b_llm_pipeline_demo.py
+```

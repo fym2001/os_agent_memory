@@ -1,77 +1,87 @@
-# B-side LLM-enhanced memory extraction plan
+# B-side LLM-only memory extraction pipeline
 
-## Why this change
+## Current direction
 
-The original B-side extractors are rule-first implementations for Phase 1.
-They are still useful because they are deterministic, cheap, easy to test, and
-compatible with `MemoryEvent -> MemoryCandidate`.  However, preference and
-knowledge extraction are semantically open-ended.  Continuing to add regexes is
-not a scalable final design.
+B-side semantic memory extraction has moved from:
 
-This local update keeps the existing rule extractors as a stable baseline and
-adds an optional LLM semantic layer.  The code does not import any model SDK and
-does not call a real model by itself.  Callers inject an object implementing
-`complete_json(prompt, schema)`.
+```text
+rule-oriented extraction
+```
+
+to:
+
+```text
+LLM as the only semantic extraction path
+```
+
+The old public class names and method signatures are kept for Phase 1
+compatibility, but their internal extraction logic no longer depends on
+hardcoded regexes, keyword lists, frequency rules, event-type shortcuts,
+text-length thresholds, or local confidence gates.
 
 ## External design ideas mapped to this project
 
 | Reference idea | Adopted project design |
 | --- | --- |
-| LangMem: use an LLM to expand or consolidate long-term memory from conversations and current memory state | `LLMMemoryExtractor` receives original events plus rule candidates, then returns structured candidate memory |
-| Mem0: user-scoped long-term preference and personalization memory | generated candidates keep `user_id`, `session_id`, `task_id`, scope, confidence, and evidence |
-| Graphiti: temporal/provenance-aware evolving facts | LLM candidates include `provenance`, `source_event_ids`, evidence, possible conflicts, and temporal event metadata |
+| LangMem: LLM-assisted long-term memory extraction and consolidation | LLM receives `MemoryEvent[]` and returns structured candidate memory |
+| Mem0: user-scoped long-term preference and personalization memory | candidates preserve `user_id`, `session_id`, `task_id`, scope, confidence, evidence, and reason |
+| Graphiti: temporal/provenance-aware evolving facts | candidates preserve source event ids, event timestamps, evidence, and possible conflict metadata |
+
+These are design references only. The local code does not import a specific
+model SDK and does not call a real model by itself.
 
 ## Architecture
 
 ```text
-MemoryEvent(s)
-   |
-   |-- existing rule extractors
-   |     - PreferenceExtractor
-   |     - KnowledgeExtractor
-   |     - WorkflowExtractor
-   |     - ToolExtractor
-   |
-   |-- optional LLM semantic extractor
-   |     - schema-constrained JSON output
-   |     - injected LLM client
-   |     - no vendor dependency
-   |
-   v
+MemoryEvent / MemoryEvent[]
+        |
+        v
+Sanitize and package event payloads
+        |
+        v
+LLMJsonClient.complete_json(prompt, schema)
+        |
+        v
+LLM structured JSON
+        |
+        v
 CandidateValidator
-   - remove temporary/non-long-term candidates
-   - reject credential-like content
-   - redact common sensitive values
-   - adjust confidence by evidence completeness
-   |
-   v
+        |
+        v
 CandidateMerger
-   - de-duplicate rule and LLM candidates
-   - boost candidates corroborated by both paths
-   - annotate possible conflicts under the same type/category
-   |
-   v
+        |
+        v
 MemoryCandidate[]
 ```
 
-## New local modules
+## Local modules
 
 - `extractors/llm_memory_extractor.py`
   - `LLMJsonClient`: minimal protocol for a JSON-capable model adapter.
-  - `LLMMemoryExtractor`: converts model JSON into `MemoryCandidate`.
-  - `HybridMemoryExtractor`: rule-first extractor with optional LLM enrichment.
-  - `CandidateValidator`: filters, redacts, and confidence-adjusts candidates.
-  - `CandidateMerger`: de-duplicates and merges rule/LLM candidates.
+  - `set_default_llm_client(...)`: process-local adapter registration used by
+    legacy static extractor signatures.
+  - `LLMMemoryExtractor`: packages events, calls the injected LLM client, and
+    converts model JSON into `MemoryCandidate`.
+  - `LLMWorkflowBoundaryExtractor`: asks the model for workflow boundaries.
+  - `CandidateValidator`: validates model output, rejects credential-like
+    non-safety candidates, redacts common sensitive values, and filters
+    candidates explicitly marked non-long-term by the model.
+  - `CandidateMerger`: de-duplicates candidates and annotates possible
+    conflicts.
 
-- `tests/test_llm_memory_extractor.py`
-  - uses a fake LLM client;
-  - no network, no API key, no model dependency.
+- Thin compatibility facades:
+  - `extractors/preference_extractor.py`
+  - `extractors/knowledge_extractor.py`
+  - `extractors/workflow_extractor.py`
+  - `extractors/tool_extractor.py`
+  - `extractors/environment_extractor.py`
 
-## Compatibility with original B tasks
+## Compatibility with B task signatures
 
-The original B function signatures remain unchanged:
+The following methods remain available:
 
 - `PreferenceExtractor.extract_from_conversation(...)`
+- `PreferenceExtractor.extract_from_tool_result(...)`
 - `PreferenceExtractor.extract_explicit_preference(...)`
 - `PreferenceExtractor.extract_implicit_preference(...)`
 - `KnowledgeExtractor.extract_from_tool_result(...)`
@@ -80,22 +90,16 @@ The original B function signatures remain unchanged:
 - `WorkflowExtractor.extract_tool_sequence(...)`
 - `WorkflowExtractor.extract_multi_step_workflow(...)`
 - `WorkflowExtractor.detect_workflow_boundary(...)`
+- `ToolExtractor.calculate_tool_success_rate(...)`
+- `ToolExtractor.extract_tool_pattern(...)`
+- `EnvironmentExtractor.extract_from_tool_output(...)`
 
-The LLM path is additive:
-
-```python
-HybridMemoryExtractor.extract_from_conversation(event, llm_client=None)
-HybridMemoryExtractor.extract_from_tool_result(event, llm_client=None)
-HybridMemoryExtractor.extract_from_session(events, llm_client=None)
-```
-
-If `llm_client` is `None`, the pipeline remains rule-only.  If the model fails
-in production, callers can fall back to the existing rule extractors without
-breaking downstream storage.
+If no default LLM client is configured, these methods return empty results
+instead of falling back to hardcoded extraction.
 
 ## Prompt/output contract
 
-The LLM returns JSON shaped like:
+The LLM must return JSON shaped like:
 
 ```json
 {
@@ -117,51 +121,43 @@ The LLM returns JSON shaped like:
 }
 ```
 
-The pipeline then validates and converts this into a normal `MemoryCandidate`.
+The local pipeline converts this into normal `MemoryCandidate` objects.
 
-## Trigger policy
+## What was intentionally removed
 
-The LLM layer is not called for every event.  It is intended for:
+- preference regex rules;
+- knowledge/FAQ keyword extraction;
+- repeated-task frequency extraction;
+- workflow keyword boundary detection;
+- path/category environment heuristics;
+- event-type shortcuts for whether to call an LLM;
+- `len(text) > 120`, `len(text) > 240`, `confidence >= 0.9`, and similar
+  unexplained thresholds.
 
-- natural language that has preference signals but no confident rule match;
-- longer tool results or summaries that may contain reusable knowledge;
-- session-level workflow extraction and compaction;
-- user feedback or task summaries where the long-term value is semantic.
+Remaining regexes are limited to secret/contact redaction and slug/id
+normalization. Remaining numeric logic is limited to structural validation,
+confidence clamping to `[0, 1]`, and boundary index checking.
 
-High-confidence simple rules, such as `以后都用 Markdown 输出`, can skip LLM
-calls to reduce cost and latency.
+## Verification
 
-## Current verification
-
-Local verification command:
+Targeted tests:
 
 ```powershell
-python -m pytest tests/test_extractors.py tests/test_workflow_extractor.py tests/test_tool_extractor.py tests/test_environment_extractor.py tests/test_ingestion_to_extractors.py tests/test_llm_memory_extractor.py -q
+python -m pytest tests/test_extractors.py tests/test_llm_memory_extractor.py tests/test_environment_extractor.py tests/test_tool_extractor.py tests/test_workflow_extractor.py tests/test_ingestion_to_extractors.py -q
 ```
 
-Current result:
+Coverage:
 
-```text
-38 passed
+```powershell
+python -m coverage run -m pytest tests/test_extractors.py tests/test_llm_memory_extractor.py tests/test_environment_extractor.py tests/test_tool_extractor.py tests/test_workflow_extractor.py tests/test_ingestion_to_extractors.py -q
+python -m coverage report -m --include="extractors/*"
 ```
 
-## Next engineering steps before upload
+Input/output demo:
 
-1. Decide whether the team wants this in the same B PR line or a separate
-   Phase 2 branch.
-2. Agree on a production LLM adapter interface:
-   - cloud model;
-   - local model;
-   - mock-only for evaluation.
-3. Build a preference/knowledge/workflow evaluation dataset:
-   - clear long-term preferences;
-   - implicit repeated behaviors;
-   - temporary instructions that must not be stored;
-   - sensitive content that must be rejected or redacted.
-4. Add offline metrics:
-   - precision;
-   - recall;
-   - false-positive rate;
-   - conflict rate;
-   - latency and fallback rate.
+```powershell
+python demo\b_llm_pipeline_demo.py
+```
 
+The demo prints raw `MemoryEvent[]`, sanitized prompt JSON, fake LLM JSON, and
+final `MemoryCandidate[]`.

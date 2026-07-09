@@ -1,179 +1,201 @@
-# B 组 LLM 增强记忆抽取方案
+# B 组 LLM-only 记忆抽取方案
 
-## 1. 为什么要改
+## 1. 当前改动结论
 
-原来 B 组的记忆抽取模块主要是规则和启发式实现，比如通过关键词、正则和频次统计来识别用户偏好、知识和工作流。
-
-这个方案在第一阶段是合理的，因为它有几个优点：
-
-- 稳定、可复现；
-- 容易写单元测试；
-- 不依赖外部模型；
-- 方便和 A 组的 `MemoryEvent` 输入对接；
-- 输出统一为 `MemoryCandidate`，后续存储和检索模块可以直接使用。
-
-但是如果后续继续只靠硬编码规则，会遇到明显问题。用户真实表达通常不是固定模板，例如：
+B 侧抽取逻辑已经从：
 
 ```text
-这种报告以后别写太散，先给结论再展开。
-类似这种流程以后可以直接复用。
-这种文件下次别弄成一大段，最好整理成表格。
+规则 baseline + LLM 语义增强
 ```
 
-这些表达靠正则很难长期覆盖。所以这次调整的目标不是推翻原来的规则抽取，而是把 B 组模块升级成：
+调整为：
 
 ```text
-规则 baseline + LLM 语义抽取 + 校验合并
+LLM 作为唯一正式语义抽取路径
 ```
 
-这样既保留第一阶段稳定、可测的成果，也能往大模型应用方向扩展。
+也就是说，`PreferenceExtractor`、`KnowledgeExtractor`、`WorkflowExtractor`、
+`ToolExtractor`、`EnvironmentExtractor` 这些旧类名仍然保留，但它们内部不再运行
+正则、关键词、频次统计、工具序列规则或路径分类规则。
 
-## 2. 参考的开源项目
+保留旧类名和旧函数签名的原因是向后兼容团队接口，避免影响 A 侧 `MemoryEvent`
+输入和后续存储/检索模块。
 
-这次设计主要参考了三个方向：
+## 2. 为什么要这样改
 
-| 开源项目 | 参考点 | 对本项目的启发 |
-| --- | --- | --- |
-| LangMem | 从对话中提取、更新和整合长期记忆 | 记忆不是简单保存聊天记录，而是从上下文中抽取可复用信息 |
-| Mem0 | 用户偏好、个性化长期记忆、跨会话记忆 | 偏好记忆要以用户为中心，支持长期复用 |
-| Graphiti | 事件溯源、时间关系、知识演化和冲突处理 | 每条记忆都应该保留来源证据，并考虑后续冲突和更新 |
+会议反馈的核心是：偏好、知识、工作流这类记忆抽取不能长期依赖硬编码。
 
-这里没有直接引入这些项目的依赖，只是参考它们的架构思想。
+硬编码的问题是：
 
-## 3. 总体架构
+- 自然语言表达变化太多，正则很难覆盖；
+- “以后”“默认”“别写太散”这类表达需要语义判断；
+- 工具结果、流程模板、长期偏好之间经常混在一起，需要模型归纳；
+- 规则里出现 `120`、`240`、`0.9` 这类阈值时，很难解释来源；
+- 后期要做泛化评测，规则堆叠会越来越难维护。
 
-当前设计是一个混合管线：
+因此现在的方案是让 LLM 做判断，代码只负责数据协议和安全边界。
+
+## 3. 新架构
 
 ```text
 MemoryEvent / MemoryEvent[]
         |
-        |-- 原有规则抽取器
-        |     - PreferenceExtractor
-        |     - KnowledgeExtractor
-        |     - WorkflowExtractor
-        |     - ToolExtractor
+        v
+Sanitize before prompt
         |
-        |-- 可选 LLM 语义抽取器
-        |     - 复杂偏好理解
-        |     - 工具结果总结
-        |     - 可复用知识抽取
-        |     - 工作流归纳
+        v
+LLMJsonClient.complete_json(prompt, schema)
+        |
+        v
+LLM structured JSON
         |
         v
 CandidateValidator
         |
-        |-- 过滤临时指令
-        |-- 过滤非长期记忆
-        |-- 敏感信息脱敏或拒绝
-        |-- 修正 confidence
-        |
         v
 CandidateMerger
-        |
-        |-- 规则结果和 LLM 结果去重
-        |-- 两边同时命中时提高置信度
-        |-- 标注潜在冲突
         |
         v
 MemoryCandidate[]
 ```
 
-核心思路是：
+其中：
 
-- 规则层负责稳定、明确、低成本的抽取；
-- LLM 层负责复杂自然语言理解；
-- Validator 负责防止误存、脏数据和敏感信息；
-- Merger 负责合并、去重和冲突标注；
-- 最终输出仍然是统一的 `MemoryCandidate`。
+- `MemoryEvent` 是 A 侧/ingestion 侧传进来的标准事件；
+- `LLMJsonClient` 是模型适配接口，可以接云端模型、本地模型或 fake client；
+- `CandidateValidator` 只做安全和结构校验，不做规则抽取；
+- `CandidateMerger` 只做去重和冲突标记，不做规则增强；
+- 输出仍然是 `MemoryCandidate[]`，方便后续存储模块继续对接。
 
-## 4. 原来的硬编码规则保留在哪里
+## 4. 保留了什么，删除了什么
 
-原来的规则没有删除，主要仍然保留在这些模块里：
+保留：
 
-```text
-extractors/preference_extractor.py
-extractors/knowledge_extractor.py
-extractors/workflow_extractor.py
-extractors/tool_extractor.py
-extractors/environment_extractor.py
-```
+- 旧函数名；
+- 旧返回类型；
+- `MemoryEvent` / `MemoryCandidate` 数据结构；
+- Phase 0 表结构；
+- 敏感信息过滤；
+- 候选去重；
+- 冲突标记；
+- fake LLM 测试方式。
 
-这些规则现在的定位是 baseline，也就是稳定基线。
+删除或停用：
 
-它们主要处理明确、简单、可测试的场景，例如：
+- 偏好正则；
+- FAQ 正则；
+- 工具成功率本地统计；
+- 工作流关键词边界检测；
+- 路径类型硬编码识别；
+- `should_call_llm` 里的事件类型捷径；
+- `len(text) > 120`、`len(text) > 240`、`confidence >= 0.9` 这类门槛。
 
-```text
-以后都用 Markdown 输出。
-默认用中文回答。
-回答尽量简洁。
-用户连续多次使用 bash 工具。
-用户多次使用 format=pdf 参数。
-```
+## 5. 旧 API 现在怎么工作
 
-这些情况没有必要每次都调用大模型，因为规则识别更稳定、更便宜，也更容易验收。
-
-## 5. 新增了什么
-
-这次新增的核心文件是：
-
-```text
-extractors/llm_memory_extractor.py
-```
-
-里面主要新增了四个部分：
-
-### 5.1 LLMMemoryExtractor
-
-负责把大模型返回的结构化 JSON 转成 `MemoryCandidate`。
-
-它不直接绑定某个模型 SDK，而是通过一个统一接口接入：
+### PreferenceExtractor
 
 ```python
-complete_json(prompt, schema)
+PreferenceExtractor.extract_from_conversation(event)
+PreferenceExtractor.extract_from_tool_result(event)
+PreferenceExtractor.extract_explicit_preference(content)
+PreferenceExtractor.extract_implicit_preference(events)
 ```
 
-这样后续可以接：
+现在全部调用默认 LLM client，只返回 `MemoryType.PREFERENCE`。
 
-- 云端大模型；
-- 本地大模型；
-- 团队封装的模型服务；
-- 测试用 fake client。
+### KnowledgeExtractor
 
-### 5.2 HybridMemoryExtractor
+```python
+KnowledgeExtractor.extract_from_tool_result(event)
+KnowledgeExtractor.extract_from_conversation(event)
+KnowledgeExtractor.extract_templates(events)
+```
 
-这是混合抽取入口。
+现在全部调用 LLM，由模型判断是否是知识或模板。
 
-它会先调用原有规则抽取器，再根据情况决定是否调用 LLM。
+### WorkflowExtractor
 
-如果没有传入 LLM client，它就只走规则版，不影响原系统。
+```python
+WorkflowExtractor.detect_workflow_boundary(events)
+WorkflowExtractor.extract_tool_sequence(events)
+WorkflowExtractor.extract_multi_step_workflow(events)
+```
 
-### 5.3 CandidateValidator
+边界和流程都由 LLM 输出，不再用关键词或工具序列规则。
 
-负责对候选记忆做校验，防止 LLM 输出直接入库。
+### ToolExtractor
 
-主要处理：
+```python
+ToolExtractor.extract_tool_pattern(events)
+ToolExtractor.calculate_tool_success_rate(tool_name, events)
+```
 
-- 临时指令过滤；
-- 非长期记忆过滤；
-- 低置信度过滤；
-- API key、token、password 等敏感内容拒绝；
-- 手机号、邮箱等信息脱敏；
-- 根据 evidence 完整性修正 confidence。
+工具经验由 LLM 输出。成功率不再本地统计，而是读取 LLM 输出候选中的
+`metadata.success_rate`。
 
-### 5.4 CandidateMerger
+### EnvironmentExtractor
 
-负责合并规则抽取和 LLM 抽取结果。
+```python
+EnvironmentExtractor.extract_from_tool_output(output)
+```
 
-主要处理：
+环境信息由 LLM 从系统上下文中判断，不再本地根据 key/path 推断。
 
-- 相同候选去重；
-- 规则和 LLM 同时命中时提高置信度；
-- 合并来源事件；
-- 标注同类型下可能冲突的候选。
+## 6. LLM 处理前后数据结构
 
-## 6. LLM 输出格式
+### 6.1 LLM 处理前输入
 
-LLM 不直接返回一段自然语言，而是要求返回结构化 JSON，例如：
+输入是 `MemoryEvent` 或 `MemoryEvent[]`。
+
+示例：
+
+```json
+{
+  "event_id": "demo-conv-001",
+  "user_id": "user-demo",
+  "event_type": "conversation",
+  "content": "这种报告以后别写太散，先给结论再展开。"
+}
+```
+
+工具结果示例：
+
+```json
+{
+  "event_id": "demo-tool-001",
+  "event_type": "tool_result",
+  "tool_name": "batch_export",
+  "input": {
+    "files": ["a.docx", "b.docx"],
+    "format": "pdf"
+  },
+  "output": {
+    "status": "success",
+    "file": "report.pdf",
+    "api_key": "sk-demo-secret"
+  }
+}
+```
+
+### 6.2 入模前脱敏
+
+进入 LLM 前会把敏感字段替换掉：
+
+```json
+{
+  "output": {
+    "status": "success",
+    "file": "report.pdf",
+    "api_key": "[REDACTED_SECRET]"
+  }
+}
+```
+
+这一步是安全处理，不是记忆抽取规则。
+
+### 6.3 LLM 原始输出
+
+LLM 必须返回结构化 JSON：
 
 ```json
 {
@@ -184,125 +206,66 @@ LLM 不直接返回一段自然语言，而是要求返回结构化 JSON，例�
       "memory_type": "preference",
       "category": "response_order",
       "value": "conclusion_first",
-      "scope": "report_writing",
+      "scope": "demo",
       "content": "用户偏好报告类内容先给结论再展开",
-      "confidence": 0.84,
-      "evidence": "这种报告还是先给结论好一点",
-      "reason": "用户表达了可复用的后续报告写作偏好",
+      "confidence": 0.88,
+      "evidence": "这种报告以后别写太散，先给结论再展开。",
+      "reason": "LLM 判断这是长期写作偏好。",
       "sensitivity": "none"
     }
   ]
 }
 ```
 
-这样做的原因是：
+### 6.4 LLM 处理后输出
 
-- 输出可控；
-- 方便测试；
-- 方便校验；
-- 方便后续入库；
-- 可以保留 evidence 和 reason，便于解释。
+代码把 LLM JSON 转为 `MemoryCandidate`：
 
-## 7. 什么时候调用 LLM
-
-不是所有事件都调用 LLM。
-
-当前策略是：
-
-- 明确规则能高置信识别的，不调用 LLM；
-- 规则没覆盖但有偏好信号的，调用 LLM；
-- 工具结果较长、可能包含可复用知识的，调用 LLM；
-- session 级工作流归纳，适合调用 LLM；
-- 普通临时任务、空内容、明显噪声，不调用 LLM。
-
-这样可以控制成本和延迟，也能保证规则 baseline 继续发挥作用。
-
-## 8. 和原 B 组需求的兼容性
-
-这次改动没有破坏原来的 B 组要求：
-
-- 不改已有函数签名；
-- 不改 `MemoryEvent`；
-- 不改 `MemoryCandidate`；
-- 不改 `core/constants.py`；
-- 不改 Phase 0 表结构；
-- 原来的 `PreferenceExtractor`、`KnowledgeExtractor`、`WorkflowExtractor` 仍然可以单独使用；
-- 新增 LLM 管线只是可选增强层。
-
-也就是说，当前方案可以向后兼容。
-
-## 9. 当前测试情况
-
-本地 B 组相关测试结果：
-
-```text
-45 passed
+```json
+{
+  "memory_type": "preference",
+  "key": "preference.response_order.conclusion_first",
+  "content": "用户偏好报告类内容先给结论再展开",
+  "confidence": 0.88,
+  "source": "llm_extracted",
+  "metadata": {
+    "extraction_method": "llm_semantic",
+    "evidence": "这种报告以后别写太散，先给结论再展开。",
+    "reason": "LLM 判断这是长期写作偏好。"
+  }
+}
 ```
 
-覆盖率结果：
+## 7. 本地演示脚本
 
-```text
-TOTAL coverage: 88%
-llm_memory_extractor.py coverage: 92%
+运行：
+
+```bash
+python demo/b_llm_pipeline_demo.py
 ```
 
-新增测试使用的是 fake LLM client，不依赖真实 API，不需要模型 key，也不需要下载额外模型。
+它会打印：
 
-测试覆盖了：
+1. LLM 处理前的原始 `MemoryEvent` 数据集；
+2. 入模前脱敏后的 JSON；
+3. LLM prompt 结构；
+4. fake LLM 原始输出 JSON；
+5. 校验/脱敏/转换后的 `MemoryCandidate[]`；
+6. 旧 B 侧 API 现在的 LLM-only 输出。
 
-- LLM 识别复杂自然语言偏好；
-- 高置信规则命中时跳过 LLM；
-- 规则和 LLM 同时命中时合并并提高置信度；
-- 临时指令不进入长期记忆；
-- 敏感信息过滤和脱敏；
-- 工具结果抽取为知识或模板；
-- session 级工作流归纳；
-- 冲突候选标注。
+## 8. 当前测试命令
 
-## 10. 后续建议
-
-后续建议分三步推进。
-
-第一步，先确认团队是否认可这个混合架构：
-
-```text
-规则 baseline + LLM 语义抽取 + 校验合并
+```bash
+python -m pytest tests/test_extractors.py tests/test_llm_memory_extractor.py tests/test_environment_extractor.py tests/test_tool_extractor.py tests/test_workflow_extractor.py tests/test_ingestion_to_extractors.py -q
 ```
 
-第二步，补评测数据集，而不是只依赖单元测试。
+这些测试使用 fake LLM client，不需要真实 API key，也不需要下载模型。
 
-数据集建议包括：
+## 9. 对外汇报话术
 
-- 明确偏好；
-- 隐式偏好；
-- 临时指令；
-- 敏感信息；
-- 冲突偏好；
-- 可复用工具流程；
-- 可复用知识模板。
+可以这样讲：
 
-评估指标可以包括：
-
-- precision；
-- recall；
-- false positive rate；
-- conflict rate；
-- latency；
-- fallback rate。
-
-第三步，再接真实模型 adapter。
-
-可以接：
-
-- 云端模型；
-- 本地模型；
-- 学校或团队已有模型服务；
-- mock 模型用于自动化测试。
-
-## 11. 汇报时可以这样总结
-
-这次修改的核心不是把硬编码全部删掉，而是调整它的定位。
-
-原来的规则抽取继续作为稳定 baseline，负责简单、明确、可测试的情况；新增 LLM 语义层处理复杂自然语言、工具结果总结和工作流归纳；最后通过 validator 和 merger 控制误存、敏感信息、去重和冲突问题。
-
-整体方向是把 B 组抽取模块从单纯规则识别，升级成更适合后续 Agent Memory 的混合记忆抽取管线。
+> 我这次把 B 侧抽取方向从规则增强改成了 LLM-only。旧的函数名和数据结构没有变，
+> 但内部不再依赖正则、关键词、频次统计或长度阈值。现在输入统一是 MemoryEvent，
+> 入模前先脱敏，LLM 返回结构化 JSON，最后由本地 validator/merger 转成
+> MemoryCandidate。这样既满足主管说的“大模型替代硬编码”，又不破坏团队已有接口。

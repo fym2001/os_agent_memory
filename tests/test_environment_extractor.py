@@ -1,132 +1,72 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
+import pytest
+
 from core.constants import MemoryType
 from extractors.environment_extractor import EnvironmentExtractor
+from extractors.llm_memory_extractor import clear_default_llm_client, set_default_llm_client
 
 
-def test_extract_environment_from_structured_tool_output() -> None:
-    output = {
-        "user_id": "alice",
-        "paths": {
-            "Downloads": r"C:\Users\alice\Downloads",
-            "Documents": r"C:\Users\alice\Documents",
-        },
-        "locale": "zh_CN.UTF-8",
-        "installed_software": [
-            {"name": "LibreOffice", "version": "24.2"},
-            {"display_name": "Firefox", "release": "126"},
-        ],
-        "system": {"os_name": "Kylin Desktop", "version": "V11"},
-        "api_key": "must-not-be-extracted",
-    }
+class EnvironmentFakeLLMClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
 
-    candidates = EnvironmentExtractor.extract_from_tool_output(output)
-    by_key = {candidate.key: candidate for candidate in candidates}
-
-    assert set(by_key) >= {
-        "environment.path.downloads",
-        "environment.path.documents",
-        "environment.locale.language",
-        "environment.locale.region",
-        "environment.software.libreoffice",
-        "environment.software.firefox",
-        "environment.system.version",
-    }
-    assert all(candidate.user_id == "alice" for candidate in candidates)
-    assert all(candidate.memory_type is MemoryType.ENVIRONMENT for candidate in candidates)
-    assert by_key["environment.path.downloads"].metadata["path"] == r"~\Downloads"
-    assert by_key["environment.path.documents"].metadata["path"] == r"~\Documents"
-    assert by_key["environment.locale.language"].metadata["language"] == "zh"
-    assert by_key["environment.locale.region"].metadata["region"] == "CN"
-    assert by_key["environment.software.libreoffice"].metadata["version"] == "24.2"
-    assert by_key["environment.system.version"].metadata["version"] == "Kylin Desktop V11"
-    assert "api_key" not in str([candidate.to_dict() for candidate in candidates])
+    def complete_json(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        request = json.loads(prompt)
+        self.calls.append({"request": request, "prompt": prompt, "schema": schema})
+        return {
+            "candidates": [
+                {
+                    "is_memory_worthy": True,
+                    "is_long_term": True,
+                    "memory_type": "environment",
+                    "category": "path",
+                    "value": "documents",
+                    "scope": "system",
+                    "content": "常用文档目录是 /root/docs",
+                    "confidence": 0.9,
+                    "evidence": "documents=/root/docs",
+                    "reason": "LLM 从系统上下文中识别出可复用目录配置。",
+                    "sensitivity": "none",
+                }
+            ]
+        }
 
 
-def test_environment_extraction_supports_common_output_shapes_and_is_deterministic() -> None:
-    output = {
-        "downloads": "/home/bob/Downloads",
-        "documents": "/home/bob/Documents",
-        "language": "en-US",
-        "region": "us",
-        "applications": {
-            "VS Code": "1.90",
-            "git": {"version": "2.45"},
-        },
-        "os_version": "Ubuntu 24.04",
-    }
-
-    first = EnvironmentExtractor.extract_from_tool_output(output)
-    second = EnvironmentExtractor.extract_from_tool_output(output)
-    by_key = {candidate.key: candidate for candidate in first}
-
-    assert by_key["environment.path.downloads"].metadata["path"] == r"~\Downloads"
-    assert by_key["environment.path.documents"].metadata["path"] == r"~\Documents"
-    assert by_key["environment.locale.language"].metadata["language"] == "en"
-    assert by_key["environment.locale.region"].metadata["region"] == "US"
-    assert by_key["environment.software.vs_code"].metadata["version"] == "1.90"
-    assert by_key["environment.software.git"].metadata["version"] == "2.45"
-    assert by_key["environment.system.version"].metadata["version"] == "Ubuntu 24.04"
-    assert [(candidate.key, candidate.candidate_id) for candidate in first] == [
-        (candidate.key, candidate.candidate_id) for candidate in second
-    ]
-
-
-def test_environment_extractor_rejects_non_mapping_output() -> None:
+@pytest.fixture()
+def env_client() -> EnvironmentFakeLLMClient:
+    client = EnvironmentFakeLLMClient()
+    set_default_llm_client(client)
     try:
-        EnvironmentExtractor.extract_from_tool_output([])  # type: ignore[arg-type]
-    except TypeError as exc:
-        assert "output must be a dict" in str(exc)
-    else:  # pragma: no cover - explicit failure branch
-        raise AssertionError("non-mapping output must be rejected")
+        yield client
+    finally:
+        clear_default_llm_client()
 
 
-def test_environment_preserves_absolute_docs_path_and_filters_nested_secrets() -> None:
-    output = {
-        "docs": "/root/docs",
-        "nested": {
-            "token": "must-not-leak",
-            "paths": {"download_dir": "/root/downloads"},
-        },
-    }
+def test_environment_extractor_wraps_tool_output_for_llm(env_client: EnvironmentFakeLLMClient) -> None:
+    output = {"user_id": "u-env", "documents": "/root/docs", "api_key": "sk-secret-1234567890"}
 
     candidates = EnvironmentExtractor.extract_from_tool_output(output)
-    by_key = {candidate.key: candidate for candidate in candidates}
-    rendered = str([candidate.to_dict() for candidate in candidates])
 
-    assert by_key["environment.path.documents"].metadata["path"] == r"\root\docs"
-    assert by_key["environment.path.downloads"].metadata["path"] == r"\root\downloads"
-    assert "must-not-leak" not in rendered
+    assert candidates[0].memory_type is MemoryType.ENVIRONMENT
+    assert candidates[0].key == "environment.path.documents"
+    request = env_client.calls[0]["request"]
+    assert request["mode"] == "environment_from_tool_output"
+    assert request["events"][0]["output"]["documents"] == "/root/docs"
+    assert request["events"][0]["output"]["api_key"] == "[REDACTED_SECRET]"
+    assert "sk-secret-1234567890" not in env_client.calls[0]["prompt"]
 
 
-def test_environment_extractor_handles_empty_and_partial_output() -> None:
+def test_environment_extractor_has_no_rule_fallback_without_client() -> None:
+    clear_default_llm_client()
+
+    assert EnvironmentExtractor.extract_from_tool_output({"documents": "/root/docs"}) == []
+
+
+def test_environment_extractor_rejects_non_dict_and_empty_input(env_client: EnvironmentFakeLLMClient) -> None:
     assert EnvironmentExtractor.extract_from_tool_output({}) == []
-
-    partial = EnvironmentExtractor.extract_from_tool_output({"locale": "zh"})
-    by_key = {candidate.key: candidate for candidate in partial}
-
-    assert set(by_key) == {"environment.locale.language"}
-    assert by_key["environment.locale.language"].metadata["language"] == "zh"
-
-
-def test_environment_extractor_handles_deep_nested_values_and_sets() -> None:
-    output = {
-        "user_id": "deep-user",
-        "level1": {
-            "level2": {
-                "docs_path": "/users/alice/docs",
-                "installed_packages": {"Python", "WPS Office"},
-                "private_token": "do-not-store",
-            }
-        },
-    }
-
-    candidates = EnvironmentExtractor.extract_from_tool_output(output)
-    by_key = {candidate.key: candidate for candidate in candidates}
-    rendered = str([candidate.to_dict() for candidate in candidates])
-
-    assert by_key["environment.path.documents"].metadata["path"] == r"~\docs"
-    assert "environment.software.python" in by_key
-    assert "environment.software.wps_office" in by_key
-    assert all(candidate.user_id == "deep-user" for candidate in candidates)
-    assert "do-not-store" not in rendered
+    assert EnvironmentExtractor.extract_from_tool_output([]) == []  # type: ignore[arg-type]
+    assert env_client.calls == []
