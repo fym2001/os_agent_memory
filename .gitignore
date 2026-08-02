@@ -8,3 +8,6 @@ data/processed/
 data/raw/*.jsonl
 data/raw/*.db
 *.log
+.coverage
+.coverage.*
+htmlcov/
